@@ -15,7 +15,7 @@ import librosa
 import numpy as np
 from PyQt6.QtCore import QLine, QRectF, Qt, QThread, QUrl, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPainter, QPen
-from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PyQt6.QtMultimedia import QAudioOutput, QMediaDevices, QMediaPlayer
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QHBoxLayout, QLabel, QMainWindow,
@@ -470,6 +470,11 @@ class GuitarTrackerApp(QMainWindow):
         self.media_player.positionChanged.connect(self.position_changed)
         self.media_player.durationChanged.connect(self.duration_changed)
 
+        # Qt locks playback to whatever the default output was at startup. Follow the
+        # system default instead, so e.g. Bluetooth headphones connected later are used.
+        self.media_devices = QMediaDevices(self)
+        self.media_devices.audioOutputsChanged.connect(self.follow_default_output)
+
     def _set_controls_enabled(self, file_btn, playback):
         self.file_btn.setEnabled(file_btn)
         self.record_btn.setEnabled(file_btn)
@@ -531,7 +536,13 @@ class GuitarTrackerApp(QMainWindow):
         if self.media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.media_player.pause()
         else:
+            self.follow_default_output()  # catch default-device changes Qt didn't announce
             self.media_player.play()
+
+    def follow_default_output(self):
+        default = QMediaDevices.defaultAudioOutput()
+        if not default.isNull() and default.id() != self.audio_output.device().id():
+            self.audio_output.setDevice(default)
 
     def position_changed(self, position):
         """Keep the scrubber, graph playhead and note readout in sync with playback."""
