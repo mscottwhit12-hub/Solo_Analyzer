@@ -44,9 +44,8 @@ jobs:
         shell: bash
         run: |
           pyi-archive_viewer -l -r dist/SoloAnalyzer.exe > contents.txt
-          grep -iE "portaudio|ffmpeg" contents.txt
           grep -q "libportaudio" contents.txt || { echo "::error::PortAudio missing from build"; exit 1; }
-          grep -qE "imageio_ffmpeg.binaries.ffmpeg" contents.txt || { echo "::error::ffmpeg missing from build"; exit 1; }
+          grep -qE "imageio_ffmpeg.+binaries.+ffmpeg-" contents.txt || { echo "::error::ffmpeg missing from build"; exit 1; }
 
       - name: Verify bundle (macOS)
         if: runner.os == 'macOS'
