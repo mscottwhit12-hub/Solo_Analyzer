@@ -24,9 +24,9 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
           cache: pip
@@ -37,14 +37,22 @@ jobs:
           pip install -r requirements.txt pyinstaller
 
       - name: Build
-        run: >
-          pyinstaller solo_analyzer.py
-          --name SoloAnalyzer
-          --onefile
-          --windowed
-          --noconfirm
-          --collect-data librosa
-          --collect-all imageio_ffmpeg
+        run: pyinstaller SoloAnalyzer.spec --noconfirm
+
+      - name: Verify bundle (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          pyi-archive_viewer -l -r dist/SoloAnalyzer.exe > contents.txt
+          grep -q "libportaudio" contents.txt || { echo "::error::PortAudio missing from build"; exit 1; }
+          grep -q "imageio_ffmpeg/binaries/ffmpeg" contents.txt || { echo "::error::ffmpeg missing from build"; exit 1; }
+
+      - name: Verify bundle (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          find dist/SoloAnalyzer.app -name "libportaudio*" | grep -q . || { echo "::error::PortAudio missing from build"; exit 1; }
+          find dist/SoloAnalyzer.app -path "*imageio_ffmpeg/binaries/ffmpeg*" | grep -q . || { echo "::error::ffmpeg missing from build"; exit 1; }
+          plutil -p dist/SoloAnalyzer.app/Contents/Info.plist | grep -q NSMicrophoneUsageDescription || { echo "::error::Info.plist missing mic permission text"; exit 1; }
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -54,7 +62,7 @@ jobs:
         if: runner.os == 'macOS'
         run: ditto -c -k --keepParent dist/SoloAnalyzer.app ${{ matrix.asset }}
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.asset }}
           path: ${{ matrix.asset }}

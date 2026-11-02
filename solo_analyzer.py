@@ -23,6 +23,8 @@ from PyQt6.QtWidgets import (
 )
 from scipy.signal import medfilt
 
+import recording
+
 # --- Constants -------------------------------------------------------------
 
 SAMPLE_RATE = 22050      # Hz, audio is resampled to this before analysis
@@ -402,9 +404,13 @@ class GuitarTrackerApp(QMainWindow):
 
         controls_layout = QHBoxLayout()
 
-        self.file_btn = QPushButton("Select Video")
+        self.file_btn = QPushButton("Open File")
         self.file_btn.clicked.connect(self.select_file)
         controls_layout.addWidget(self.file_btn)
+
+        self.record_btn = QPushButton("Record")
+        self.record_btn.clicked.connect(self.open_recorder)
+        controls_layout.addWidget(self.record_btn)
 
         self.file_label = QLabel("No file selected")
         controls_layout.addWidget(self.file_label)
@@ -466,6 +472,7 @@ class GuitarTrackerApp(QMainWindow):
 
     def _set_controls_enabled(self, file_btn, playback):
         self.file_btn.setEnabled(file_btn)
+        self.record_btn.setEnabled(file_btn)
         self.play_btn.setEnabled(playback)
         self.scrubber.setEnabled(playback)
 
@@ -477,10 +484,23 @@ class GuitarTrackerApp(QMainWindow):
             self.breakdown_widget.update_breakdown(self.f0, root, scale)
 
     def select_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Open Video File", "",
-                                              "Video Files (*.mp4 *.avi *.mov *.mkv)")
-        if not path:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Video or Audio File", "",
+            "Media Files (*.mp4 *.avi *.mov *.mkv *.wav *.mp3 *.flac *.m4a *.aac *.ogg)")
+        if path:
+            self.load_file(path)
+
+    def open_recorder(self):
+        if recording.AUDIO_IMPORT_ERROR:
+            QMessageBox.critical(self, "Record", f"Audio recording is unavailable:\n{recording.AUDIO_IMPORT_ERROR}")
             return
+        self.media_player.pause()
+        dialog = recording.RecordDialog(self)
+        if dialog.exec() and dialog.output_path:
+            self.load_file(dialog.output_path)
+
+    def load_file(self, path):
+        """Start playback and background pitch analysis for a video or audio file."""
         self.video_path = path
         self.file_label.setText(os.path.basename(path))
         self.info_panel.setText("Analyzing audio...")
