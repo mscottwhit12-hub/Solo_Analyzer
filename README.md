@@ -48,6 +48,15 @@ pip install -r requirements.txt
 python solo_analyzer.py
 ```
 
+## Diagnostics tab
+
+The **Diagnostics** tab shows the audio the way the pitch tracker sees it, and why each note was chosen:
+
+- **Spectrogram:** frequency (with note labels) over 8 seconds around the playhead. It overlays the tracker's raw pitch (white dots) and the final notes (green). Below it, a lane marks every correction: octave fixes, bends/slides credited to their target note, notes held by hysteresis, removed blips and filled gaps. A second lane shows the tracker's confidence. Hover to read off a note and frequency, and click to jump there.
+- **Spectrum at the playhead:** the frequency content of that instant, with the chosen note's harmonics marked (1×, 2×, 3×…). If the tracker's raw pick differed, it's marked too.
+- **Step-by-step explanation** of the current moment, from what the tracker heard, through tuning, hysteresis, bend handling and octave fixes, to the final note and scale degree.
+- **Signal switch:** compare what the tracker analyzes (drums removed) with the original audio.
+
 ## How it works
 
 1. ffmpeg (bundled through `imageio-ffmpeg`) extracts mono audio at 22.05 kHz.

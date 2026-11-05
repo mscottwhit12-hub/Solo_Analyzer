@@ -27,7 +27,7 @@ sys.path.insert(0, HERE)
 
 import numpy as np
 
-import solo_analyzer as sa
+import analysis as sa
 from synth import A_MINOR, RENDER_SR, make_case
 
 CASES = [("solo", 11, False), ("solo", 23, False), ("with backing", 11, True), ("with backing", 37, True)]

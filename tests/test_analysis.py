@@ -11,9 +11,10 @@ from PyQt6.QtCore import QPointF, Qt
 from PyQt6.QtGui import QMouseEvent
 from PyQt6.QtWidgets import QApplication
 
+import analysis as an
 import solo_analyzer as sa
 
-SR = sa.SAMPLE_RATE
+SR = an.SAMPLE_RATE
 
 
 @pytest.fixture(scope="session")
@@ -49,96 +50,96 @@ def frames(*notes_and_counts):
 
 def test_breakdown_uses_correct_root():
     # Regression: A used to count as ♭3 in A minor (9-semitone offset).
-    assert sa.degree_breakdown(frames((69, 5)), "A", "Minor") == {"1": 100.0}
-    assert sa.degree_breakdown(frames((72, 5)), "A", "Minor") == {"♭3": 100.0}
-    assert sa.degree_breakdown(frames((76, 5)), "A", "Minor") == {"5": 100.0}
-    assert sa.degree_breakdown(frames((70, 5)), "A", "Minor") == {"Out": 100.0}
-    assert sa.degree_breakdown(frames((-1, 5)), "A", "Minor") == {}
+    assert an.degree_breakdown(frames((69, 5)), "A", "Minor") == {"1": 100.0}
+    assert an.degree_breakdown(frames((72, 5)), "A", "Minor") == {"♭3": 100.0}
+    assert an.degree_breakdown(frames((76, 5)), "A", "Minor") == {"5": 100.0}
+    assert an.degree_breakdown(frames((70, 5)), "A", "Minor") == {"Out": 100.0}
+    assert an.degree_breakdown(frames((-1, 5)), "A", "Minor") == {}
 
 
-@pytest.mark.parametrize("scale", list(sa.SCALES))
-@pytest.mark.parametrize("root", sa.NOTE_NAMES)
+@pytest.mark.parametrize("scale", list(an.SCALES))
+@pytest.mark.parametrize("root", an.NOTE_NAMES)
 def test_readout_and_breakdown_agree(root, scale):
     for midi in range(40, 90):
-        expected = sa.degree_of(sa.note_name(midi), root, scale)
-        assert sa.degree_breakdown(frames((midi, 3)), root, scale) == {expected: 100.0}
+        expected = an.degree_of(an.note_name(midi), root, scale)
+        assert an.degree_breakdown(frames((midi, 3)), root, scale) == {expected: 100.0}
 
 
 def test_cents_are_relative_to_tuning():
-    assert sa.cents_off(hz(69.18), 69) == 18
-    assert sa.cents_off(hz(68.9), 69, tuning=-10) == 0   # in tune for a guitar tuned 10 cents flat
-    assert sa.cents_off(0.0, -1) == 0
-    assert sa.note_name(69) == "A" and sa.note_name(-1) is None
+    assert an.cents_off(hz(69.18), 69) == 18
+    assert an.cents_off(hz(68.9), 69, tuning=-10) == 0   # in tune for a guitar tuned 10 cents flat
+    assert an.cents_off(0.0, -1) == 0
+    assert an.note_name(69) == "A" and an.note_name(-1) is None
 
 
 def test_blues_scale_has_flat_five():
-    assert sa.degree_of("D#", "A", "Blues") == "♭5"
-    assert sa.degree_of("B", "A", "Minor Pentatonic") == "Out"
+    assert an.degree_of("D#", "A", "Blues") == "♭5"
+    assert an.degree_of("B", "A", "Minor Pentatonic") == "Out"
 
 
 def test_detect_key():
     a_minor = np.repeat([69, 72, 76, 74, 69, 67, 69, 64, 72, 69], 50)
-    assert sa.detect_key(a_minor) == ("A", "Minor")
+    assert an.detect_key(a_minor) == ("A", "Minor")
     c_major = np.repeat([60, 64, 67, 65, 62, 60, 67, 71, 72, 60], 50)
-    assert sa.detect_key(c_major) == ("C", "Major")
-    assert sa.detect_key(np.full(100, -1)) is None
+    assert an.detect_key(c_major) == ("C", "Major")
+    assert an.detect_key(np.full(100, -1)) is None
 
 
 # --- note tracking ---------------------------------------------------------
 
 def test_tuning_estimate():
     f0 = hz(np.repeat([69, 72, 74, 76], 20) - 0.12)
-    assert abs(sa.estimate_tuning(f0) - -12) < 1
+    assert abs(an.estimate_tuning(f0) - -12) < 1
 
 
 def test_vibrato_stays_on_its_note():
-    t = np.arange(200) * sa.HOP_LENGTH / SR
+    t = np.arange(200) * an.HOP_LENGTH / SR
     f0 = hz(69 + 0.45 * np.sin(2 * np.pi * 5.5 * t))  # wide ±45 cent vibrato
-    assert set(sa.quantize_notes(f0, 0.0)) == {69}
+    assert set(an.quantize_notes(f0, 0.0)) == {69}
 
 
 def test_bend_transit_counts_as_target_and_held_note_is_kept():
     hold, rise, top = 15, 20, 30
     pitch = np.concatenate([np.full(hold, 74.0), np.linspace(74, 76, rise), np.full(top, 76.0)])
-    notes = sa.quantize_notes(hz(pitch), 0.0)
+    notes = an.quantize_notes(hz(pitch), 0.0)
     assert set(notes[:hold]) == {74}                      # D held before the bend
     assert 75 not in notes                                # the bend is never counted as D#
-    left_d = pitch - 74 > sa.SETTLED_SEMITONES
+    left_d = pitch - 74 > an.SETTLED_SEMITONES
     assert set(notes[left_d]) == {76}                     # once it has left D, it counts as E
 
 
 def test_fast_legato_notes_are_not_swallowed():
     pitch = np.repeat([72, 74] * 6, 9).astype(float)  # 105 ms C/D trill
-    assert np.array_equal(sa.quantize_notes(hz(pitch), 0.0), pitch.astype(int))
+    assert np.array_equal(an.quantize_notes(hz(pitch), 0.0), pitch.astype(int))
 
 
 def test_double_stop_subharmonic_is_folded_back():
     # A4 phrase with a passage reported two octaves low (what a fourth double stop produces)
     notes = frames((69, 40), (72, 40), (50, 30), (74, 40), (72, 40))
     f0 = hz(notes.astype(float))
-    fixed_f0, fixed = sa.fix_octave_errors(f0, notes)
+    fixed_f0, fixed = an.fix_octave_errors(f0, notes)
     assert set(fixed[80:110]) == {74}
     assert np.allclose(fixed_f0[80:110], hz(74))
 
 
 def test_real_octave_leap_is_kept():
     notes = frames((69, 60), (81, 60), (79, 60), (76, 60))  # A4 up to A5, then down: a real leap
-    _, fixed = sa.fix_octave_errors(hz(notes.astype(float)), notes)
+    _, fixed = an.fix_octave_errors(hz(notes.astype(float)), notes)
     assert np.array_equal(fixed, notes)
 
 
 def test_islands_and_gaps():
     notes = frames((-1, 10), (60, 2), (-1, 10), (69, 20), (-1, 3), (69, 20))
     f0 = np.where(notes >= 0, hz(np.maximum(notes, 0).astype(float)), 0.0)
-    f0, notes = sa.remove_islands(f0, notes)
+    f0, notes = an.remove_islands(f0, notes)
     assert 60 not in notes                     # 2-frame blip dropped
-    f0, notes = sa.fill_gaps(f0, notes)
+    f0, notes = an.fill_gaps(f0, notes)
     assert set(notes[22:65]) == {69}           # 3-frame dropout inside the held A bridged
 
 
 def test_display_range_ignores_outliers():
     f0 = np.concatenate([hz(np.repeat(np.arange(60, 80), 50).astype(float)), hz(np.array([30.0, 100.0]))])
-    low, high = sa.display_range(f0)
+    low, high = an.display_range(f0)
     assert np.log2(high / low) < 2.5
 
 
@@ -146,53 +147,53 @@ def test_display_range_ignores_outliers():
 
 def test_tracks_notes_up_to_e6():
     y = melody([88, 86, 84], note_seconds=0.6)  # E6, D6, C6
-    result = sa.analyze_pitch(y, SR)
+    result = an.analyze_pitch(y, SR)
     assert {88, 86, 84} <= set(result.notes)
 
 
 def test_chunked_tracking_matches_whole_file():
     y = melody([57, 60, 62, 64, 67, 69, 72, 74, 76, 74, 72, 69] * 4)  # ~22 s, three chunks
-    assert len(y) / SR > 2 * sa.CHUNK_SECONDS
-    chunked, chunked_voiced = sa.track_pitch(y, SR)
-    whole, whole_voiced, _ = librosa.pyin(y, fmin=librosa.note_to_hz(sa.PITCH_FLOOR),
-                                          fmax=librosa.note_to_hz(sa.PITCH_CEILING),
-                                          sr=SR, hop_length=sa.HOP_LENGTH, frame_length=sa.FRAME_LENGTH)
+    assert len(y) / SR > 2 * an.CHUNK_SECONDS
+    chunked, chunked_voiced, _ = an.track_pitch(y, SR)
+    whole, whole_voiced, _ = librosa.pyin(y, fmin=librosa.note_to_hz(an.PITCH_FLOOR),
+                                          fmax=librosa.note_to_hz(an.PITCH_CEILING),
+                                          sr=SR, hop_length=an.HOP_LENGTH, frame_length=an.FRAME_LENGTH)
     assert len(chunked) == len(whole)
     assert np.mean(chunked_voiced == whole_voiced) > 0.98
     both = chunked_voiced & whole_voiced
-    assert np.mean(np.abs(sa.hz_to_midi(chunked[both]) - sa.hz_to_midi(whole[both])) < 0.5) > 0.99
+    assert np.mean(np.abs(an.hz_to_midi(chunked[both]) - an.hz_to_midi(whole[both])) < 0.5) > 0.99
 
 
 def test_full_analysis_on_a_melody():
     played = [69, 72, 74, 76, 79, 76, 74, 72]
-    result = sa.analyze_pitch(melody(played, note_seconds=0.35), SR)
+    result = an.analyze_pitch(melody(played, note_seconds=0.35), SR)
     assert len(result.f0) == len(result.times) == len(result.notes)
     assert set(result.notes[result.notes >= 0]) == set(played)
     assert abs(result.tuning) < 5
 
 
 def test_cancel_stops_analysis():
-    with pytest.raises(sa.AnalysisCancelled):
-        sa.analyze_pitch(melody([60] * 10), SR, cancelled=lambda: True)
+    with pytest.raises(an.AnalysisCancelled):
+        an.analyze_pitch(melody([60] * 10), SR, cancelled=lambda: True)
 
 
 def test_progress_reaches_the_end():
     seen = []
-    sa.analyze_pitch(melody([60, 64]), SR, progress=lambda fraction, message: seen.append(fraction))
+    an.analyze_pitch(melody([60, 64]), SR, progress=lambda fraction, message: seen.append(fraction))
     assert seen == sorted(seen) and seen[-1] >= 0.95
 
 
 def test_cache_roundtrip(app, tmp_path):
     media = tmp_path / "clip.wav"
     media.write_bytes(b"fake")
-    result = sa.AnalysisResult(np.array([0.0, 440.0]), np.array([0.0, 0.01]), np.array([-1, 69]), -7.5)
-    assert sa.load_cached(str(media)) is None
-    sa.save_cached(str(media), result)
-    cached = sa.load_cached(str(media))
+    result = an.AnalysisResult(np.array([0.0, 440.0]), np.array([0.0, 0.01]), np.array([-1, 69]), -7.5)
+    assert an.load_cached(str(media)) is None
+    an.save_cached(str(media), result)
+    cached = an.load_cached(str(media))
     assert np.array_equal(cached.f0, result.f0) and np.array_equal(cached.notes, result.notes)
     assert cached.tuning == -7.5
     media.write_bytes(b"changed!")  # different size -> different cache entry
-    assert sa.load_cached(str(media)) is None
+    assert an.load_cached(str(media)) is None
 
 
 # --- widgets ---------------------------------------------------------------
@@ -223,3 +224,70 @@ def test_graph_click_requests_seek(app):
                                       Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
                                       Qt.KeyboardModifier.NoModifier))
     assert got and abs(got[0] - 25.0) < 0.1
+
+
+# --- diagnostics -----------------------------------------------------------
+
+import diagnostics as dg  # noqa: E402
+
+
+def test_spectrogram_puts_a_tone_on_its_row():
+    t = np.arange(SR) / SR
+    image = dg.log_spectrogram(np.sin(2 * np.pi * 440 * t).astype(np.float32))
+    assert image.shape == (1 + SR // an.HOP_LENGTH, len(dg.spectrogram_rows()))
+    loudest_row = int(np.median(np.argmax(image[10:-10], axis=1)))
+    assert abs(dg.spectrogram_rows()[loudest_row] - 440) < 440 * 0.03
+
+
+def test_spectrogram_chunks_line_up(monkeypatch):
+    y = melody([60, 67, 72, 76] * 3)
+    whole = dg.log_spectrogram(y)
+    monkeypatch.setattr(dg, "SPEC_CHUNK_FRAMES", 97)  # many chunks, odd boundaries
+    assert np.array_equal(dg.log_spectrogram(y), whole)
+
+
+def fake_result():
+    n = 12
+    notes = np.array([69] * 4 + [76] * 4 + [-1] * 4)
+    r = an.AnalysisResult(an.midi_to_hz(np.maximum(notes, 0)).astype(float) * (notes >= 0), np.arange(n) * 0.0116,
+                          notes, -8.0)
+    r.raw_f0 = r.f0.copy()
+    r.raw_f0[4:8] = an.midi_to_hz(52)        # tracker reported E3; octave fix moved it to E5
+    r.confidence = np.full(n, 0.9)
+    r.held_notes = np.array([69, 69, 68, 69, 52, 52, 52, 52, -1, -1, -1, -1])
+    r.swept_notes = r.held_notes.copy()
+    r.octave_shift = np.array([0] * 4 + [24] * 4 + [0] * 4)
+    r.removed = np.zeros(n, bool)
+    r.filled = np.zeros(n, bool)
+    return r
+
+
+def test_explanations_name_each_decision():
+    r = fake_result()
+    octave = " ".join(dg.explain_frame(r, 5, "A", "Minor"))
+    assert "Octave fix" in octave and "two octaves" in octave and "E5" in octave and "degree <b>5</b>" in octave
+    plain = " ".join(dg.explain_frame(r, 0, "A", "Minor"))
+    assert "A4" in plain and "degree <b>1</b>" in plain and "Octave fix" not in plain
+    assert "no note" in " ".join(dg.explain_frame(r, 10, "A", "Minor"))
+
+
+def test_analysis_records_every_stage():
+    result = an.analyze_pitch(melody([69, 72, 74, 76]), SR)
+    n = len(result.notes)
+    for name in an.AnalysisResult.DIAGNOSTIC_FIELDS:
+        assert len(getattr(result, name)) == n, name
+    assert result.audio is not None and result.tracked_audio is not None
+
+
+def test_diagnostics_panel_renders(app):
+    from PyQt6.QtGui import QImage
+    r = an.analyze_pitch(melody([69, 72, 74, 76, 79]), SR)
+    panel = dg.DiagnosticsPanel()
+    panel.resize(1100, 700)
+    panel.set_result(r, None)
+    panel._on_ready({"tracked": dg.log_spectrogram(r.tracked_audio), "original": dg.log_spectrogram(r.audio)})
+    panel.set_time(1.0)
+    panel.signal_input.setCurrentText(dg.SIGNAL_ORIGINAL)
+    image = QImage(panel.size(), QImage.Format.Format_ARGB32)
+    panel.render(image)
+    assert "Result" in panel.explanation.text()
