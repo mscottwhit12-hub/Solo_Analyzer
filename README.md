@@ -2,11 +2,19 @@
 
 Open a video or audio file of a guitar solo, or record one straight into the app, and see what the notes are doing against a chosen key. The app tracks the pitch over time and shows:
 
-- **Live readout** of the current note and its scale degree as the video plays
+- **Live readout** of the current note, how many cents sharp or flat it is (handy for checking bends), and its scale degree
 - **Breakdown bar** showing how much of the solo sits on each scale degree, and how much is outside the scale
-- **Scrolling pitch graph** of the last 30 seconds, drawn against the scale-degree lines
+- **Scrolling pitch graph** of the last 30 seconds, drawn against the scale-degree lines. Click it to jump to that moment.
 
-Supports major and minor scales in all 12 keys.
+Scales: major, minor, minor and major pentatonic, blues, Dorian and Mixolydian, in all 12 keys. The key is detected automatically when a file finishes analyzing. Untick **Auto-detect key** to set it yourself.
+
+### Practice controls
+
+- **Speed:** play at 25%, 50%, 75% or 100% without changing pitch.
+- **Keyboard:** <kbd>Space</kbd> play/pause, <kbd>←</kbd>/<kbd>→</kbd> skip 5 s, <kbd>Shift</kbd>+<kbd>←</kbd>/<kbd>→</kbd> skip 1 s, <kbd>Home</kbd> back to the start.
+- **Drag and drop** a video or audio file onto the window to open it.
+- Analysis shows progress and can be cancelled. Results are cached, so reopening a file is instant.
+- The app remembers your key, scale, speed and window size.
 
 ## Recording
 
@@ -45,10 +53,18 @@ python solo_analyzer.py
 1. ffmpeg (bundled through `imageio-ffmpeg`) extracts mono audio at 22.05 kHz.
    Recordings capture audio through PortAudio (`sounddevice`) and webcam video through Qt, then ffmpeg combines them, correcting for the difference in start times.
 2. Harmonic/percussive separation removes most of the drums.
-3. librosa's pYIN tracks the fundamental frequency between C2 and C6.
-4. A drift filter treats a large pitch jump with no pick attack as detection jitter. A median filter then smooths the result.
+3. librosa's pYIN tracks the fundamental frequency between C2 and E6 (24th fret on the high E string), in 10-second chunks so progress can be shown.
+4. A drift filter treats a large pitch jump with no pick attack as detection jitter, unless the pitch was already sliding that way. A median filter then smooths the result.
+5. Each pitch is rounded to the nearest note to get its scale degree. The readout and the breakdown bar use the same rule. The key is estimated by matching how long each note is played against standard major and minor key profiles (Krumhansl–Kessler).
 
 The analysis works best on isolated or lightly backed guitar.
+
+## Tests
+
+```bash
+pip install pytest
+python -m pytest tests
+```
 
 ## Building
 
