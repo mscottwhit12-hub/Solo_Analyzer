@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 
 # Numba (used by librosa) caches compiled functions next to their source files,
 # which don't exist inside a frozen executable. Point the cache somewhere writable.
@@ -33,18 +34,39 @@ HOP_LENGTH = 256         # samples between analysis frames
 MIN_PITCH_HZ = 20.0      # anything at or below this is treated as "no pitch"
 PITCH_FLOOR = 'C2'       # pitch tracking range: below a drop-C low string...
 PITCH_CEILING = 'E6'     # ...up to the 24th fret of the high E string
-ANALYSIS_VERSION = 2     # bump whenever analysis output changes, to invalidate cached results
+FRAME_LENGTH = 1024      # samples per pitch window (46 ms): short enough for fast runs
+USE_HPSS = True          # strip drums/percussive sound before tracking
+ANALYSIS_VERSION = 3     # bump whenever analysis output changes, to invalidate cached results
 
 # Pitch is tracked in chunks so progress can be reported and analysis cancelled.
 # Each chunk gets extra context on both sides, which is discarded after tracking.
 CHUNK_SECONDS = 10.0
 CHUNK_CONTEXT_SECONDS = 1.0
 
-# Drift filter: a jump bigger than this (in semitones) with no pick attack is treated as
-# detection jitter, unless the pitch was already sliding the same way.
-JUMP_THRESHOLD = 1.5
-SLIDE_MIN_PREV_STEP = 0.1
-SLIDE_MAX_STEP = 4.0
+# Note tracking (see quantize_notes)
+NOTE_HYSTERESIS = 0.7        # semitones the pitch must move before the note changes
+SWEEP_MIN_SEMITONES = 0.6    # a short run that travels at least this far...
+SWEEP_STRAIGHTNESS = 0.7     # ...mostly in one direction...
+SWEEP_MAX_SECONDS = 0.3      # ...within this time, still moving at its end, is a bend/slide
+STEADY_STEP_SEMITONES = 0.03 # frame-to-frame change below this is "holding"...
+STEADY_MIN_FRAMES = 3        # ...and a run that holds this long is a note, not a transition
+SETTLED_SEMITONES = 0.35     # a frame further than this from its note has left it
+
+# Clean-up (see fix_octave_errors, remove_islands, fill_gaps)
+OCTAVE_SUSPECT_SEMITONES = 10  # a passage this far from its neighbours may be an octave error...
+SUBHARMONIC_SUSPECT_SEMITONES = 14  # ...this far from the local register, almost certainly is
+OCTAVE_NEIGHBOUR_GAP = 0.3     # seconds of silence after which notes aren't neighbours
+OCTAVE_FIT_SEMITONES = 7       # ...if shifting it by octaves brings it this close to them
+OCTAVE_FIX_MAX_SECONDS = 1.0   # longer passages are trusted as real leaps
+OCTAVE_CONTEXT_SECONDS = 2.0   # the register is judged from this much playing either side
+# Semitone corrections for locking onto the wrong harmonic: 1/2, 1/3, 1/4, 1/5 of the true
+# frequency (sub-harmonics) or 2x, 3x (overtones)
+HARMONIC_SHIFTS = (12, 19, 24, 28, -12, -19)
+SALIENCE_FFT = 4096
+SALIENCE_HARMONICS = 5
+SALIENCE_DECAY = 0.8
+MIN_NOTE_FRAMES = 4            # ~46 ms
+MAX_GAP_FRAMES = 4
 
 NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
@@ -101,13 +123,16 @@ def get_intervals(scale):
     return SCALES.get(scale, SCALES[DEFAULT_SCALE])
 
 
-def note_info(freq):
-    """(note name, cents off that note) for a frequency, or (None, 0) if there's no pitch."""
-    if np.isnan(freq) or freq <= MIN_PITCH_HZ:
-        return None, 0
-    midi = hz_to_midi(freq)
-    nearest = int(round(midi))
-    return NOTE_NAMES[nearest % 12], int(round((midi - nearest) * 100))
+def note_name(midi):
+    """Note name for a MIDI number, None for -1 (no note)."""
+    return NOTE_NAMES[int(midi) % 12] if midi >= 0 else None
+
+
+def cents_off(freq, midi, tuning=0.0):
+    """How far a frequency is from a note, in cents, relative to the instrument's tuning."""
+    if midi < 0 or not freq > MIN_PITCH_HZ:
+        return 0
+    return int(round((hz_to_midi(freq) - tuning / 100 - midi) * 100))
 
 
 def degree_of(note_name, root, scale):
@@ -118,14 +143,14 @@ def degree_of(note_name, root, scale):
     return get_intervals(scale).get(semitones, "Out")
 
 
-def degree_breakdown(f0, root, scale):
-    """{degree label: % of pitched frames}. Uses the same nearest-note rule as the live readout."""
-    if f0 is None or root not in NOTE_NAMES:
+def degree_breakdown(notes, root, scale):
+    """{degree label: % of time with a note}, from per-frame notes (the same ones the readout shows)."""
+    if notes is None or root not in NOTE_NAMES:
         return {}
-    pitched = f0[f0 > MIN_PITCH_HZ]
+    pitched = notes[notes >= 0]
     if len(pitched) == 0:
         return {}
-    semitones = (np.round(hz_to_midi(pitched)).astype(int) - NOTE_NAMES.index(root)) % 12
+    semitones = (pitched - NOTE_NAMES.index(root)) % 12
     counts = np.bincount(semitones, minlength=12)
     percentages = {}
     for semitone, label in get_intervals(scale).items():
@@ -137,12 +162,12 @@ def degree_breakdown(f0, root, scale):
     return percentages
 
 
-def detect_key(f0):
+def detect_key(notes):
     """Best-guess (root, "Major"/"Minor") from how long each pitch class is played, or None."""
-    pitched = f0[f0 > MIN_PITCH_HZ]
+    pitched = notes[notes >= 0]
     if len(pitched) == 0:
         return None
-    histogram = np.bincount(np.round(hz_to_midi(pitched)).astype(int) % 12, minlength=12)
+    histogram = np.bincount(pitched % 12, minlength=12)
     if np.count_nonzero(histogram) < 2:
         return None
     best = None
@@ -197,7 +222,7 @@ def track_pitch(y, sr, progress=None, cancelled=None):
         segment = y[first * HOP_LENGTH:min(len(y), last * HOP_LENGTH + HOP_LENGTH)]
         seg_f0, seg_voiced, _ = librosa.pyin(
             segment, fmin=librosa.note_to_hz(PITCH_FLOOR), fmax=librosa.note_to_hz(PITCH_CEILING),
-            sr=sr, hop_length=HOP_LENGTH,
+            sr=sr, hop_length=HOP_LENGTH, frame_length=FRAME_LENGTH,
         )
         keep = slice(start - first, end - first)
         f0[start:end] = seg_f0[keep]
@@ -207,48 +232,216 @@ def track_pitch(y, sr, progress=None, cancelled=None):
     return f0, voiced
 
 
-def remove_drift(f0, onset_env, rms):
-    """Hold the previous pitch through big jumps that have no pick attack and aren't slides."""
-    corrected = f0.copy()
-    if len(corrected) <= 2:
-        return corrected
-    midi = np.zeros_like(corrected)
-    valid = corrected > MIN_PITCH_HZ
-    midi[valid] = hz_to_midi(corrected[valid])
+@dataclass
+class AnalysisResult:
+    f0: np.ndarray      # pitch contour for the graph, Hz (0 = no pitch)
+    times: np.ndarray   # seconds, one per frame
+    notes: np.ndarray   # note being played per frame (MIDI number), -1 = none
+    tuning: float       # how far the instrument is from A440, in cents
 
-    for i in range(2, len(corrected) - 1):
-        if not (corrected[i] > MIN_PITCH_HZ and corrected[i - 1] > MIN_PITCH_HZ):
+
+def estimate_tuning(f0):
+    """Cents offset of the playing from A440, from where pitches sit between semitones."""
+    pitched = f0[f0 > MIN_PITCH_HZ]
+    if len(pitched) < 10:
+        return 0.0
+    angle = 2 * np.pi * hz_to_midi(pitched)  # semitone position as a point on a circle
+    return float(np.angle(np.mean(np.exp(1j * angle))) / (2 * np.pi) * 100)
+
+
+def runs(values):
+    """[(start, end, value)] for runs of equal consecutive values."""
+    if len(values) == 0:
+        return []
+    edges = np.flatnonzero(np.diff(values)) + 1
+    starts = np.concatenate(([0], edges))
+    ends = np.concatenate((edges, [len(values)]))
+    return [(s, e, values[s]) for s, e in zip(starts, ends)]
+
+
+def quantize_notes(f0, tuning):
+    """Which note is being played in each frame (MIDI number, -1 = none).
+
+    - Tuning-corrected, so a guitar tuned slightly flat doesn't drift into neighbouring notes.
+    - Hysteresis: the note only changes once the pitch moves NOTE_HYSTERESIS semitones away,
+      so wide vibrato stays on its note.
+    - Frames where the pitch is sweeping through notes on its way somewhere (bends, slides,
+      releases) are credited to the note it arrives at.
+    """
+    notes = np.full(len(f0), -1, dtype=int)
+    pitched = f0 > MIN_PITCH_HZ
+    midi = np.zeros(len(f0))
+    midi[pitched] = hz_to_midi(f0[pitched]) - tuning / 100
+
+    current = None
+    for i in range(len(f0)):
+        if not pitched[i]:
+            current = None
             continue
-        step = midi[i] - midi[i - 1]
-        if abs(step) <= JUMP_THRESHOLD:
+        if current is None or abs(midi[i] - current) > NOTE_HYSTERESIS:
+            current = int(round(midi[i]))
+        notes[i] = current
+
+    # Credit sweeps to their destination. A short run that moves steadily one way and is
+    # still moving toward the next note when it ends is a transition (e.g. the D# a D->E
+    # bend passes through): it goes to the next note. Runs are processed backwards so a
+    # slide through several notes resolves all the way to where it lands.
+    for s, e, note in reversed(runs(notes)):
+        nxt = notes[e] if e < len(notes) else -1
+        if note < 0 or nxt < 0 or nxt == note:
             continue
+        if (e - s) * HOP_LENGTH / SAMPLE_RATE > SWEEP_MAX_SECONDS:
+            continue
+        lo, hi = max(0, s - 1), min(len(notes), e + 1)
+        if np.any(notes[lo:hi] < 0):
+            lo, hi = s, e  # don't measure motion across silence
+        path = midi[lo:hi]
+        if len(path) < 2:
+            continue
+        net = path[-1] - path[0]
+        steps = np.abs(np.diff(path))
+        heading = np.sign(nxt - note)
+        end_motion = midi[e - 1] - midi[max(s, e - 3)]
+        held = longest_run(steps < STEADY_STEP_SEMITONES) >= STEADY_MIN_FRAMES
+        if (not held and abs(net) >= SWEEP_MIN_SEMITONES and abs(net) >= SWEEP_STRAIGHTNESS * steps.sum()
+                and np.sign(net) == heading and np.sign(end_motion) == heading):
+            notes[s:e] = nxt  # the whole run is a transition
+        elif heading:
+            # A held note that then bends/slides away: frames that have already left the
+            # note, heading for the next one, belong to the next one.
+            k = e
+            while k > s and np.sign(midi[k - 1] - note) == heading and abs(midi[k - 1] - note) > SETTLED_SEMITONES:
+                k -= 1
+            notes[k:e] = nxt
+    return notes
 
-        has_transient = onset_env[i] > 0.3 or rms[i] > rms[i - 1] * 1.3
 
-        # A slide: the pitch was already moving the same way, and the jump isn't huge.
-        is_slide = False
-        if corrected[i - 2] > MIN_PITCH_HZ:
-            prev_step = midi[i - 1] - midi[i - 2]
-            is_slide = (np.sign(prev_step) == np.sign(step)
-                        and abs(prev_step) >= SLIDE_MIN_PREV_STEP
-                        and abs(step) <= SLIDE_MAX_STEP)
+def longest_run(mask):
+    best = count = 0
+    for value in mask:
+        count = count + 1 if value else 0
+        best = max(best, count)
+    return best
 
-        if not has_transient and not is_slide:
-            corrected[i] = corrected[i - 1]
-            midi[i] = midi[i - 1]
-    return corrected
+
+def harmonic_salience(y, sr, frames, f_hz):
+    """How strongly a frequency and its first few harmonics are present over some frames."""
+    half = SALIENCE_FFT // 2
+    start = max(0, frames.start * HOP_LENGTH - half)
+    excerpt = y[start:frames.stop * HOP_LENGTH + half]
+    if len(excerpt) < SALIENCE_FFT:
+        excerpt = np.pad(excerpt, (0, SALIENCE_FFT - len(excerpt)))
+    band = np.abs(librosa.stft(excerpt, n_fft=SALIENCE_FFT, hop_length=HOP_LENGTH, center=False)).mean(axis=1)
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=SALIENCE_FFT)
+    total = 0.0
+    for k in range(1, SALIENCE_HARMONICS + 1):
+        if k * f_hz >= freqs[-1]:
+            break
+        b = int(np.searchsorted(freqs, k * f_hz))
+        total += band[max(0, b - 1):b + 2].max() * SALIENCE_DECAY ** (k - 1)
+    return total
+
+
+def fix_octave_errors(f0, notes, y=None, sr=SAMPLE_RATE):
+    """Fold back short passages that sit whole octaves away from the notes on both sides.
+
+    Pitch trackers lock onto a harmonic or sub-harmonic when the fundamental is weak, and a
+    double stop a fourth apart repeats exactly two octaves below its top note.
+    """
+    f0, notes = f0.copy(), notes.copy()
+    context = int(OCTAVE_CONTEXT_SECONDS * SAMPLE_RATE / HOP_LENGTH)
+    max_gap = int(OCTAVE_NEIGHBOUR_GAP * SAMPLE_RATE / HOP_LENGTH)
+    max_len = int(OCTAVE_FIX_MAX_SECONDS * SAMPLE_RATE / HOP_LENGTH)
+    for _ in range(2):  # a second pass judges against the already-corrected context
+        for s, e, note in runs(notes):
+            if note < 0 or e - s > max_len:
+                continue
+            around = np.concatenate((notes[max(0, s - context):s], notes[e:e + context]))
+            around = around[around >= 0]
+            if len(around) < MIN_NOTE_FRAMES:
+                continue
+            register = np.median(around)
+            distance = abs(note - register)
+            if distance >= SUBHARMONIC_SUSPECT_SEMITONES:
+                candidates = HARMONIC_SHIFTS
+            elif distance >= OCTAVE_SUSPECT_SEMITONES and disagrees_with_neighbours(notes, s, e, max_gap):
+                candidates = (12, -12)  # a real solo can span 2 octaves: need local evidence too
+            else:
+                continue
+            fitting = [sh for sh in candidates if abs(note + sh - register) <= OCTAVE_FIT_SEMITONES]
+            if not fitting:
+                continue
+            if y is not None and len(fitting) > 1:
+                # The real note has energy at all its harmonics; a wrong guess misses some.
+                base = np.median(f0[s:e])
+                shift = max(fitting, key=lambda sh: harmonic_salience(
+                    y, sr, slice(s, e), base * 2.0 ** (sh / 12)))
+            else:
+                shift = min(fitting, key=lambda sh: abs(note + sh - register))
+            notes[s:e] = note + shift
+            f0[s:e] *= 2.0 ** (shift / 12)
+    return f0, notes
+
+
+def disagrees_with_neighbours(notes, s, e, max_gap):
+    """True if the notes just before and after (within max_gap frames) are both far from notes[s]."""
+    neighbours = []
+    before = notes[max(0, s - max_gap):s]
+    after = notes[e:e + max_gap]
+    if np.any(before >= 0):
+        neighbours.append(before[before >= 0][-1])
+    if np.any(after >= 0):
+        neighbours.append(after[after >= 0][0])
+    # Both sides must disagree: a phrase that starts on a note and leaps an octave is real.
+    return len(neighbours) == 2 and all(abs(notes[s] - n) >= OCTAVE_SUSPECT_SEMITONES for n in neighbours)
+
+
+def remove_islands(f0, notes):
+    """Drop pitched blips too short to be played notes (with nothing either side)."""
+    f0, notes = f0.copy(), notes.copy()
+    pitched = notes >= 0
+    for s, e, on in runs(pitched):
+        if on and e - s < MIN_NOTE_FRAMES:
+            notes[s:e] = -1
+            f0[s:e] = 0.0
+    return f0, notes
+
+
+def fill_gaps(f0, notes):
+    """Bridge brief dropouts inside a held note."""
+    f0, notes = f0.copy(), notes.copy()
+    segments = runs(notes)
+    for k in range(1, len(segments) - 1):
+        s, e, note = segments[k]
+        before, after = segments[k - 1][2], segments[k + 1][2]
+        if note < 0 and e - s <= MAX_GAP_FRAMES and before == after >= 0:
+            notes[s:e] = before
+            f0[s:e] = np.geomspace(f0[s - 1], f0[e], e - s + 2)[1:-1]
+    return f0, notes
+
+
+def display_range(f0):
+    """(low, high) Hz for the graph: robust to a few stray detections far from the rest."""
+    pitched = f0[f0 > MIN_PITCH_HZ]
+    if len(pitched) == 0:
+        return 80.0, 1300.0
+    low, high = np.percentile(pitched, [2, 98])
+    return max(40.0, low * 0.9), max(high * 1.1, low * 2)
 
 
 def analyze_pitch(y, sr, progress=None, cancelled=None):
-    """Return (f0, times) for an audio signal. f0 is 0 where no pitch was detected.
+    """Pitch contour, per-frame notes and tuning for an audio signal.
 
     progress(fraction, message) is called as work completes; cancelled() is polled between chunks.
     """
     report = progress or (lambda fraction, message: None)
 
-    report(0.10, "Separating guitar from drums...")
-    # Aggressive harmonic/percussive separation to pull the guitar away from drums
-    y_harmonic, _ = librosa.effects.hpss(y, margin=(1.0, 5.0))
+    if USE_HPSS:
+        report(0.10, "Separating guitar from drums...")
+        # Aggressive harmonic/percussive separation to pull the guitar away from drums
+        y_harmonic, _ = librosa.effects.hpss(y, margin=(1.0, 5.0))
+    else:
+        y_harmonic = y
     if cancelled and cancelled():
         raise AnalysisCancelled
 
@@ -257,14 +450,17 @@ def analyze_pitch(y, sr, progress=None, cancelled=None):
                              progress=lambda f: report(0.20 + 0.75 * f, "Tracking pitch..."))
 
     report(0.96, "Cleaning up...")
-    rms = librosa.feature.rms(y=y_harmonic, frame_length=2048, hop_length=HOP_LENGTH)[0]
-    onset_env = librosa.onset.onset_strength(y=y_harmonic, sr=sr, hop_length=HOP_LENGTH)
     f0[~voiced] = 0.0
-    f0 = remove_drift(np.nan_to_num(f0), onset_env, rms)
+    f0 = np.nan_to_num(f0)
 
     f0_smooth = medfilt(f0, kernel_size=3)
     times = librosa.times_like(f0_smooth, sr=sr, hop_length=HOP_LENGTH)
-    return f0_smooth, times
+    tuning = estimate_tuning(f0_smooth)
+    notes = quantize_notes(f0_smooth, tuning)
+    f0_clean, notes = fix_octave_errors(f0_smooth, notes, y_harmonic, sr)
+    f0_clean, notes = remove_islands(f0_clean, notes)
+    f0_clean, notes = fill_gaps(f0_clean, notes)
+    return AnalysisResult(f0_clean, times, notes, tuning)
 
 
 # --- Result cache ----------------------------------------------------------
@@ -281,23 +477,23 @@ def cache_path(media_path):
 def load_cached(media_path):
     try:
         with np.load(cache_path(media_path)) as data:
-            return data["f0"], data["times"]
+            return AnalysisResult(data["f0"], data["times"], data["notes"], float(data["tuning"]))
     except (OSError, KeyError, ValueError):
         return None
 
 
-def save_cached(media_path, f0, times):
+def save_cached(media_path, result):
     try:
         path = cache_path(media_path)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        np.savez_compressed(path, f0=f0, times=times)
+        np.savez_compressed(path, f0=result.f0, times=result.times, notes=result.notes, tuning=result.tuning)
     except OSError:
         pass  # caching is an optimization; never fail analysis over it
 
 
 class AudioAnalyzerThread(QThread):
     """Extracts the audio track and runs pitch detection off the GUI thread."""
-    analysis_done = pyqtSignal(np.ndarray, np.ndarray)
+    analysis_done = pyqtSignal(object)  # AnalysisResult
     progress = pyqtSignal(int, str)
     error = pyqtSignal(str)
     cancelled = pyqtSignal()
@@ -318,7 +514,7 @@ class AudioAnalyzerThread(QThread):
 
             cached = load_cached(self.media_path)
             if cached is not None:
-                self.analysis_done.emit(*cached)
+                self.analysis_done.emit(cached)
                 return
 
             self.progress.emit(0, "Extracting audio...")
@@ -327,13 +523,13 @@ class AudioAnalyzerThread(QThread):
                 self.error.emit("The file contains no audio track to analyze.")
                 return
 
-            f0, times = analyze_pitch(
+            result = analyze_pitch(
                 y, SAMPLE_RATE,
                 progress=lambda fraction, message: self.progress.emit(int(fraction * 100), message),
                 cancelled=lambda: self.cancel_requested,
             )
-            save_cached(self.media_path, f0, times)
-            self.analysis_done.emit(f0, times)
+            save_cached(self.media_path, result)
+            self.analysis_done.emit(result)
         except AnalysisCancelled:
             self.cancelled.emit()
         except Exception as e:
@@ -365,8 +561,8 @@ class ScaleBreakdownWidget(QWidget):
         self.font = QFont(UI_FONT, 9)
         self.setFixedHeight(50)
 
-    def update_breakdown(self, f0, root, scale):
-        self.percentages = degree_breakdown(f0, root, scale)
+    def update_breakdown(self, notes, root, scale):
+        self.percentages = degree_breakdown(notes, root, scale)
         self._fit_height()
         self.update()
 
@@ -443,12 +639,7 @@ class PitchGraphWidget(QWidget):
     def set_data(self, times, f0):
         self.times = times
         self.f0 = f0
-        valid_freqs = f0[f0 > MIN_PITCH_HZ]
-        if len(valid_freqs) > 0:
-            self.f_min = max(40.0, float(np.min(valid_freqs)) * 0.9)
-            self.f_max = max(float(np.max(valid_freqs)) * 1.1, 400.0)
-        else:
-            self.f_min, self.f_max = 80.0, 1300.0
+        self.f_min, self.f_max = display_range(f0)
         self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self.update()
 
@@ -555,8 +746,7 @@ class GuitarTrackerApp(QMainWindow):
         self.settings = QSettings()
 
         self.video_path = ""
-        self.f0 = None
-        self.times = None
+        self.result = None  # AnalysisResult of the loaded file
         self.analyzer = None
         self.is_slider_dragging = False
 
@@ -795,22 +985,25 @@ class GuitarTrackerApp(QMainWindow):
         self.progress_widget.setVisible(False)
         self.cancel_btn.setEnabled(True)
 
-    def on_analysis_finished(self, f0, times):
+    def on_analysis_finished(self, result):
         self._analysis_ended()
-        self.f0 = f0
-        self.times = times
+        self.result = result
         self._set_controls_enabled(file_btn=True, playback=True)
-        self.pitch_graph.set_data(times, f0)
+        self.pitch_graph.set_data(result.times, result.f0)
 
-        key = detect_key(f0)
+        details = [f"Tuning: {result.tuning:+.0f}¢ from A440"]
+        key = detect_key(result.notes)
         if key:
             root, mode = key
-            self.detected_label.setText(f"Detected key: {root} {mode.lower()}")
+            details.insert(0, f"Detected key: {root} {mode.lower()}")
             if self.auto_key_input.isChecked():
                 for combo, value in ((self.root_input, root), (self.scale_input, mode)):
                     combo.blockSignals(True)
                     combo.setCurrentText(value)
                     combo.blockSignals(False)
+        self.detected_label.setText("   ·   ".join(details))
+        self.detected_label.setToolTip("Notes are judged relative to the detected tuning, "
+                                       "and cents in the readout are measured from it.")
         self.on_scale_changed()
         self.info_panel.setText("Note: --   |   Scale Degree: --")
 
@@ -833,7 +1026,7 @@ class GuitarTrackerApp(QMainWindow):
         root = self.root_input.currentText()
         scale = self.scale_input.currentText()
         self.pitch_graph.set_scale_info(root, scale)
-        self.breakdown_widget.update_breakdown(self.f0, root, scale)
+        self.breakdown_widget.update_breakdown(self.result.notes if self.result else None, root, scale)
         self.position_changed(self.media_player.position())
 
     def on_speed_changed(self, text):
@@ -869,14 +1062,16 @@ class GuitarTrackerApp(QMainWindow):
         if not self.is_slider_dragging:
             self.scrubber.setValue(position)
 
-        if self.f0 is None or self.times is None:
+        if self.result is None:
             return
 
         current_time = position / 1000.0
         self.pitch_graph.set_time(current_time)
 
-        idx = np.clip(np.searchsorted(self.times, current_time, side="left"), 0, len(self.times) - 1)
-        note, cents = note_info(self.f0[idx])
+        r = self.result
+        idx = np.clip(np.searchsorted(r.times, current_time, side="left"), 0, len(r.times) - 1)
+        note = note_name(r.notes[idx])
+        cents = cents_off(r.f0[idx], r.notes[idx], r.tuning)
         degree = degree_of(note, self.root_input.currentText(), self.scale_input.currentText())
         note_text = f"{note} {cents:+d}¢" if note else "--"
         self.info_panel.setText(f"Note: {note_text}   |   Scale Degree: {degree}")

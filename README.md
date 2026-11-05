@@ -53,11 +53,33 @@ python solo_analyzer.py
 1. ffmpeg (bundled through `imageio-ffmpeg`) extracts mono audio at 22.05 kHz.
    Recordings capture audio through PortAudio (`sounddevice`) and webcam video through Qt, then ffmpeg combines them, correcting for the difference in start times.
 2. Harmonic/percussive separation removes most of the drums.
-3. librosa's pYIN tracks the fundamental frequency between C2 and E6 (24th fret on the high E string), in 10-second chunks so progress can be shown.
-4. A drift filter treats a large pitch jump with no pick attack as detection jitter, unless the pitch was already sliding that way. A median filter then smooths the result.
-5. Each pitch is rounded to the nearest note to get its scale degree. The readout and the breakdown bar use the same rule. The key is estimated by matching how long each note is played against standard major and minor key profiles (Krumhansl–Kessler).
+3. librosa's pYIN tracks pitch between C2 and E6 (24th fret on the high E string), using 46 ms windows so fast runs stay sharp. It works in 10-second chunks so progress can be shown.
+4. **Tuning:** the app measures how far the guitar is from A440 and judges notes relative to that. The offset is shown next to the detected key.
+5. **Note tracking** turns the raw pitch into the notes being played:
+   - **Vibrato** stays on its note. The note only changes once the pitch moves 0.7 semitones away.
+   - **Bends and slides** count as the note they land on, so a D bent up to E never registers as D♯.
+   - **Octave errors** get corrected. Distorted guitars and double stops can fool the tracker into reporting a note one or two octaves (or an octave and a fifth) too low. A passage that sits far outside the surrounding register is folded back. The spectrum decides which correction is right.
+   - Blips shorter than 45 ms are dropped, and brief dropouts inside a held note are filled.
+6. The readout, the breakdown bar and key detection all use these notes, so they always agree. The key is estimated with Krumhansl–Kessler key profiles.
 
-The analysis works best on isolated or lightly backed guitar.
+The analysis works best on isolated or lightly backed guitar. With a full band, a loud bass can still be mistaken for the guitar while it rests.
+
+## Accuracy benchmark
+
+`benchmark/` renders synthetic solos where the true note at every moment is known. They include bends, wide vibrato, slides, legato, double stops, a guitar tuned 10¢ flat, overdrive, room reverb, noise and AAC compression, with and without drums and bass. To score the current analysis:
+
+```bash
+python benchmark/run.py
+```
+
+On 5 solos that weren't used to tune it, the note-tracking work changed results as follows:
+
+| | Before | After |
+|---|---|---|
+| Steady notes identified correctly | 86.5% | 93.4% |
+| "Out" share (ideal ≈ 0) | 3.9% | 1.9% |
+| Breakdown bar error | 7.7% | 4.6% |
+| Graph range beyond what's played | +2.0 octaves | +0.4 octaves |
 
 ## Tests
 
