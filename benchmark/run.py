@@ -10,9 +10,10 @@ Metrics (averaged over cases):
   out %        share of the breakdown bar marked "Out" (ideal ~0: every note is in A minor)
   bar error    how far the breakdown bar is from the true one (total variation, %)
   range        octaves shown on the graph vs. octaves actually played
+  double acc   note accuracy on double stops (the right answer is the top note)
+  key          detected key (every case is A minor)
 
-Results on 5 held-out solos (not used for tuning), before -> after the note-tracking work:
-  note acc 86.5 -> 93.4, out % 3.9 -> 1.9, bar error 7.7 -> 4.6, range +2.0 -> +0.4 octaves
+See README.md ("Accuracy benchmark") for before/after results on held-out solos.
 """
 
 import os
@@ -42,28 +43,29 @@ def load_cases():
         truth_path = path + ".npz"
         if not os.path.exists(truth_path):
             truth = make_case(path, seed, with_backing=with_backing)
-            np.savez(truth_path, note=truth.note, stable=truth.stable)
+            np.savez(truth_path, note=truth.note, stable=truth.stable, double=truth.double)
         t = np.load(truth_path)
-        cases.append((f"{name} #{seed}", path, t["note"], t["stable"]))
+        cases.append((f"{name} #{seed}", path, t["note"], t["stable"], t["double"]))
     return cases
 
 
 def current_pipeline(y):
     result = sa.analyze_pitch(y, sa.SAMPLE_RATE)
+    current_pipeline.last = result
     return result.times, result.notes, sa.display_range(result.f0)
 
 
-def score(times, labels, frange, truth_note, truth_stable):
+def score(times, labels, frange, truth_note, truth_stable, truth_double):
     idx = np.clip(np.round(times * RENDER_SR).astype(int), 0, len(truth_note) - 1)
     best = None
     for lag in range(-6, 7):  # absorb codec delay
         shifted = np.clip(idx + int(lag * sa.HOP_LENGTH * RENDER_SR / sa.SAMPLE_RATE), 0, len(truth_note) - 1)
-        tn, ts = truth_note[shifted], truth_stable[shifted]
+        tn, ts, td = truth_note[shifted], truth_stable[shifted], truth_double[shifted]
         steady = (tn >= 0) & ts
         acc = np.mean(labels[steady] == tn[steady])
         if best is None or acc > best[0]:
-            best = (acc, tn, ts)
-    acc, tn, ts = best
+            best = (acc, tn, ts, td)
+    acc, tn, ts, td = best
     steady = (tn >= 0) & ts
     played = tn >= 0
 
@@ -87,6 +89,7 @@ def score(times, labels, frange, truth_note, truth_stable):
     return dict(
         note_acc=acc * 100,
         octave_err=np.mean(np.abs(labels[steady] - tn[steady]) == 12) * 100,
+        double_acc=np.mean(labels[steady & td] == tn[steady & td]) * 100 if (steady & td).any() else 100.0,
         coverage=np.mean(labels[played] >= 0) * 100,
         false_notes=np.mean(labels[silent] >= 0) * 100 if silent.any() else 0.0,
         out=out,
@@ -99,20 +102,22 @@ def score(times, labels, frange, truth_note, truth_stable):
 def main():
     pipeline = current_pipeline
     rows = []
-    for name, path, tn, ts in load_cases():
+    for name, path, tn, ts, td in load_cases():
         start = time.time()
         y = sa.extract_audio(path)
         times, labels, frange = pipeline(y)
-        r = score(times, labels, frange, tn, ts)
+        r = score(times, labels, frange, tn, ts, td)
+        r["key"] = " ".join(sa.detect_key(labels, current_pipeline.last.level_db) or ("?",))
         r["secs"] = time.time() - start
         rows.append((name, r))
 
-    cols = ["note_acc", "octave_err", "coverage", "false_notes", "out", "bar_err", "range", "secs"]
+    cols = ["note_acc", "double_acc", "octave_err", "coverage", "false_notes", "out", "bar_err", "range", "key"]
     print(f"{'case':18s}" + "".join(f"{c:>13s}" for c in cols))
     for name, r in rows:
         print(f"{name:18s}" + "".join(f"{r[c]:>13.1f}" if not isinstance(r[c], str) else f"{r[c]:>13s}" for c in cols))
-    mean = {c: np.mean([r[c] for _, r in rows]) for c in cols if c != "range"}
+    mean = {c: np.mean([r[c] for _, r in rows]) for c in cols if c not in ("range", "key")}
     mean["range"] = f"+{np.mean([r['range_excess'] for _, r in rows]):.1f} oct"
+    mean["key"] = f"{sum(r['key'] == 'A Minor' for _, r in rows)}/{len(rows)} right"
     print(f"{'MEAN':18s}" + "".join(f"{mean[c]:>13.1f}" if not isinstance(mean[c], str) else f"{mean[c]:>13s}" for c in cols))
 
 

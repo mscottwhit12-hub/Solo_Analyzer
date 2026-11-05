@@ -27,7 +27,7 @@ PITCH_FLOOR = 'C2'       # pitch tracking range: below a drop-C low string...
 PITCH_CEILING = 'E6'     # ...up to the 24th fret of the high E string
 FRAME_LENGTH = 1024      # samples per pitch window (46 ms): short enough for fast runs
 USE_HPSS = True          # strip drums/percussive sound before tracking
-ANALYSIS_VERSION = 4     # bump whenever analysis output changes, to invalidate cached results
+ANALYSIS_VERSION = 6     # bump whenever analysis output changes, to invalidate cached results
 
 # Pitch is tracked in chunks so progress can be reported and analysis cancelled.
 # Each chunk gets extra context on both sides, which is discarded after tracking.
@@ -56,7 +56,13 @@ HARMONIC_SHIFTS = (12, 19, 24, 28, -12, -19)
 SALIENCE_FFT = 4096
 SALIENCE_HARMONICS = 5
 SALIENCE_DECAY = 0.8
+PHANTOM_MAX_RATIO = 0.25          # below -12 dB at its own pitch and octave, it isn't really sounding
+                                  # (overdrive leaves difference tones there around -17 dB)
 MIN_NOTE_FRAMES = 4            # ~46 ms
+
+# Attack gaps (see fill_attack_gaps)
+ATTACK_GAP_MAX_SECONDS = 0.2   # a "no pitch" stretch this short...
+ATTACK_GAP_LEVEL_DB = -20.0    # ...that stays this loud, right before a note, belongs to it
 MAX_GAP_FRAMES = 4
 
 NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
@@ -73,9 +79,14 @@ SCALES = {
 }
 DEFAULT_SCALE = "Minor"
 
-# Krumhansl-Kessler key profiles (how strongly each pitch class implies a key).
-MAJOR_PROFILE = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88])
-MINOR_PROFILE = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+# Albrecht & Shanahan (2013) key profiles, measured on popular music: how much each pitch
+# class is used in a major / minor key. (They beat Krumhansl-Kessler on our key benchmark.)
+MAJOR_PROFILE = np.array([0.238, 0.006, 0.111, 0.006, 0.137, 0.094, 0.016, 0.214, 0.009, 0.080, 0.008, 0.081])
+MINOR_PROFILE = np.array([0.220, 0.006, 0.104, 0.123, 0.019, 0.103, 0.012, 0.214, 0.062, 0.022, 0.061, 0.052])
+PHRASE_REST_SECONDS = 0.25     # a note followed by this much silence ends a phrase
+PHRASE_END_WEIGHT = 0.25       # extra weight for phrase-ending notes (solos resolve to the tonic)
+PHRASE_QUIET_DB = -20.0        # quieter than this = resting (playing is above -5 dB, rests around -20 to -30)
+KEY_ALTERNATIVE_MARGIN = 0.08  # other keys this close to the best are shown (clear solos: gap > 0.085)
 
 
 # --- Music theory ----------------------------------------------------------
@@ -133,21 +144,50 @@ def degree_breakdown(notes, root, scale):
     return percentages
 
 
-def detect_key(notes):
-    """Best-guess (root, "Major"/"Minor") from how long each pitch class is played, or None."""
-    pitched = notes[notes >= 0]
-    if len(pitched) == 0:
-        return None
-    histogram = np.bincount(pitched % 12, minlength=12)
-    if np.count_nonzero(histogram) < 2:
-        return None
-    best = None
-    for mode, profile in (("Major", MAJOR_PROFILE), ("Minor", MINOR_PROFILE)):
-        for root in range(12):
-            score = np.corrcoef(histogram, np.roll(profile, root))[0, 1]
-            if best is None or score > best[0]:
-                best = (score, NOTE_NAMES[root], mode)
-    return best[1], best[2]
+def key_candidates(notes, level_db=None):
+    """[(root, "Major"/"Minor", score)] best first, from per-frame notes; [] if too little to go on.
+
+    Pitch classes are weighted by how long they're played, plus extra weight for notes that
+    end a phrase, since solos tend to resolve there. Scores are correlations with key profiles.
+    With per-frame loudness, quiet frames (a note's reverb tail ringing through a rest) count
+    as silence, so phrase endings are found even though the pitch tracker still hears the tail.
+    """
+    if level_db is not None:
+        notes = np.where(level_db[:len(notes)] < PHRASE_QUIET_DB, -1, notes)
+    segments = [(s, e, n) for s, e, n in runs(notes) if n >= 0]
+    if not segments:
+        return []
+    rest = int(PHRASE_REST_SECONDS * SAMPLE_RATE / HOP_LENGTH)
+    duration, phrase_end = np.zeros(12), np.zeros(12)
+    for k, (s, e, n) in enumerate(segments):
+        duration[n % 12] += e - s
+        next_start = segments[k + 1][0] if k + 1 < len(segments) else len(notes)
+        if next_start - e >= rest:
+            phrase_end[n % 12] += e - s
+    if np.count_nonzero(duration) < 2:
+        return []
+    weights = duration / duration.sum()
+    if phrase_end.sum():
+        weights = weights + PHRASE_END_WEIGHT * phrase_end / phrase_end.sum()
+    scores = [(NOTE_NAMES[root], mode, float(np.corrcoef(weights, np.roll(profile, root))[0, 1]))
+              for mode, profile in (("Major", MAJOR_PROFILE), ("Minor", MINOR_PROFILE))
+              for root in range(12)]
+    return sorted(scores, key=lambda c: c[2], reverse=True)
+
+
+def detect_key(notes, level_db=None):
+    """Best-guess (root, "Major"/"Minor") for per-frame notes, or None."""
+    candidates = key_candidates(notes, level_db)
+    return (candidates[0][0], candidates[0][1]) if candidates else None
+
+
+def close_alternatives(notes, level_db=None):
+    """Other keys that fit almost as well as the best one (ambiguity worth showing)."""
+    candidates = key_candidates(notes, level_db)
+    if not candidates:
+        return []
+    best = candidates[0][2]
+    return [(r, m) for r, m, sc in candidates[1:3] if best - sc <= KEY_ALTERNATIVE_MARGIN]
 
 
 # --- Analysis --------------------------------------------------------------
@@ -177,7 +217,10 @@ def extract_audio(path):
 
 
 def track_pitch(y, sr, progress=None, cancelled=None):
-    """pYIN pitch tracking in chunks. Returns (f0 with nan where unvoiced, voiced flags, voicing probability)."""
+    """pYIN pitch tracking in chunks.
+
+    Returns (f0 with nan where unvoiced, voiced flags, voicing probability).
+    """
     n_frames = 1 + len(y) // HOP_LENGTH
     f0 = np.full(n_frames, np.nan)
     voiced = np.zeros(n_frames, dtype=bool)
@@ -194,10 +237,10 @@ def track_pitch(y, sr, progress=None, cancelled=None):
         segment = y[first * HOP_LENGTH:min(len(y), last * HOP_LENGTH + HOP_LENGTH)]
         seg_f0, seg_voiced, seg_prob = librosa.pyin(
             segment, fmin=librosa.note_to_hz(PITCH_FLOOR), fmax=librosa.note_to_hz(PITCH_CEILING),
-            sr=sr, hop_length=HOP_LENGTH, frame_length=FRAME_LENGTH,
+            sr=sr, hop_length=HOP_LENGTH, frame_length=FRAME_LENGTH, fill_na=None,
         )
         keep = slice(start - first, end - first)
-        f0[start:end] = seg_f0[keep]
+        f0[start:end] = np.where(seg_voiced[keep], seg_f0[keep], np.nan)
         voiced[start:end] = seg_voiced[keep]
         probability[start:end] = seg_prob[keep]
         if progress:
@@ -215,6 +258,8 @@ class AnalysisResult:
     # How each frame's note was decided (shown in the Diagnostics tab)
     raw_f0: np.ndarray = None        # what the pitch tracker reported, Hz (0 = no pitch)
     confidence: np.ndarray = None    # tracker's probability that a pitch is present, 0-1
+    attack_filled: np.ndarray = None # loud "no pitch" gap just before a note, given to that note
+    level_db: np.ndarray = None      # loudness per frame, dB relative to the file's loud passages
     held_notes: np.ndarray = None    # after rounding with hysteresis
     swept_notes: np.ndarray = None   # after crediting bends/slides to where they land
     octave_shift: np.ndarray = None  # semitones the octave fix moved each frame (0 = untouched)
@@ -225,7 +270,8 @@ class AnalysisResult:
     audio: np.ndarray = field(default=None, repr=False)
     tracked_audio: np.ndarray = field(default=None, repr=False)
 
-    DIAGNOSTIC_FIELDS = ("raw_f0", "confidence", "held_notes", "swept_notes", "octave_shift", "removed", "filled")
+    DIAGNOSTIC_FIELDS = ("raw_f0", "confidence", "attack_filled", "level_db", "held_notes", "swept_notes",
+                         "octave_shift", "removed", "filled")
 
 
 def estimate_tuning(f0):
@@ -235,6 +281,34 @@ def estimate_tuning(f0):
         return 0.0
     angle = 2 * np.pi * hz_to_midi(pitched)  # semitone position as a point on a circle
     return float(np.angle(np.mean(np.exp(1j * angle))) / (2 * np.pi) * 100)
+
+
+def frame_levels(y, n_frames):
+    """Loudness of each frame in dB relative to the file's loud passages (95th percentile)."""
+    rms = librosa.feature.rms(y=y, frame_length=FRAME_LENGTH, hop_length=HOP_LENGTH)[0]
+    rms = np.pad(rms, (0, max(0, n_frames - len(rms))))[:n_frames]
+    reference = np.percentile(rms, 95) if np.any(rms > 0) else 1.0
+    return 20 * np.log10(rms / reference + 1e-9)
+
+
+def fill_attack_gaps(f0, notes, level_db):
+    """Give short, loud "no pitch" stretches just before a note to that note.
+
+    After a new attack the tracker needs ~100-150 ms to commit, longer for a double stop,
+    though the guitar is plainly sounding. A short gap that stays loud and is followed by a
+    note belongs to that note.
+    """
+    f0, notes = f0.copy(), notes.copy()
+    filled = np.zeros(len(notes), dtype=bool)
+    max_len = int(ATTACK_GAP_MAX_SECONDS * SAMPLE_RATE / HOP_LENGTH)
+    for s, e, note in runs(notes):
+        if note >= 0 or e >= len(notes) or e - s > max_len or s == 0:
+            continue
+        if np.all(level_db[s:e] >= ATTACK_GAP_LEVEL_DB):
+            notes[s:e] = notes[e]
+            f0[s:e] = f0[e]
+            filled[s:e] = True
+    return f0, notes, filled
 
 
 def runs(values):
@@ -357,7 +431,7 @@ def fix_octave_errors(f0, notes, y=None, sr=SAMPLE_RATE):
     max_len = int(OCTAVE_FIX_MAX_SECONDS * SAMPLE_RATE / HOP_LENGTH)
     for _ in range(2):  # a second pass judges against the already-corrected context
         for s, e, note in runs(notes):
-            if note < 0 or e - s > max_len:
+            if note < 0:
                 continue
             around = np.concatenate((notes[max(0, s - context):s], notes[e:e + context]))
             around = around[around >= 0]
@@ -365,9 +439,13 @@ def fix_octave_errors(f0, notes, y=None, sr=SAMPLE_RATE):
                 continue
             register = np.median(around)
             distance = abs(note - register)
-            if distance >= SUBHARMONIC_SUSPECT_SEMITONES:
+            if distance >= SUBHARMONIC_SUSPECT_SEMITONES and (
+                    e - s <= max_len or (y is not None and is_phantom_pitch(y, sr, slice(s, e), np.median(f0[s:e])))):
+                # Short passages this far out of register are errors. Long ones only if nothing
+                # is actually sounding at that pitch (a double stop's common sub-harmonic).
                 candidates = HARMONIC_SHIFTS
-            elif distance >= OCTAVE_SUSPECT_SEMITONES and disagrees_with_neighbours(notes, s, e, max_gap):
+            elif (distance >= OCTAVE_SUSPECT_SEMITONES and e - s <= max_len
+                  and disagrees_with_neighbours(notes, s, e, max_gap)):
                 candidates = (12, -12)  # a real solo can span 2 octaves: need local evidence too
             else:
                 continue
@@ -384,6 +462,28 @@ def fix_octave_errors(f0, notes, y=None, sr=SAMPLE_RATE):
             notes[s:e] = note + shift
             f0[s:e] *= 2.0 ** (shift / 12)
     return f0, notes
+
+
+def is_phantom_pitch(y, sr, frames, f_hz):
+    """True if a reported pitch has no energy of its own (at itself or its octave).
+
+    A double stop repeats at a common sub-harmonic of its two notes, so the tracker can report
+    a pitch nobody is playing. A real low note always has energy at its fundamental or 2nd
+    harmonic.
+    """
+    half = SALIENCE_FFT // 2
+    start = max(0, frames.start * HOP_LENGTH - half)
+    excerpt = y[start:frames.stop * HOP_LENGTH + half]
+    if len(excerpt) < SALIENCE_FFT:
+        excerpt = np.pad(excerpt, (0, SALIENCE_FFT - len(excerpt)))
+    band = np.abs(librosa.stft(excerpt, n_fft=SALIENCE_FFT, hop_length=HOP_LENGTH, center=False)).mean(axis=1)
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=SALIENCE_FFT)
+
+    def energy(hz):
+        b = int(np.searchsorted(freqs, hz))
+        return band[max(0, b - 1):b + 2].max() if b < len(band) else 0.0
+
+    return max(energy(f_hz), energy(2 * f_hz)) < PHANTOM_MAX_RATIO * band.max()
 
 
 def disagrees_with_neighbours(notes, s, e, max_gap):
@@ -449,8 +549,8 @@ def analyze_pitch(y, sr, progress=None, cancelled=None):
         raise AnalysisCancelled
 
     report(0.20, "Tracking pitch...")
-    f0, voiced, confidence = track_pitch(y_harmonic, sr, cancelled=cancelled,
-                                         progress=lambda f: report(0.20 + 0.75 * f, "Tracking pitch..."))
+    f0, voiced, confidence = track_pitch(
+        y_harmonic, sr, cancelled=cancelled, progress=lambda f: report(0.20 + 0.75 * f, "Tracking pitch..."))
 
     report(0.96, "Cleaning up...")
     f0[~voiced] = 0.0
@@ -464,13 +564,16 @@ def analyze_pitch(y, sr, progress=None, cancelled=None):
     swept = credit_sweeps(midi, held)
     f0_octave, octave_notes = fix_octave_errors(f0_smooth, swept, y_harmonic, sr)
     f0_islands, island_notes = remove_islands(f0_octave, octave_notes)
-    f0_clean, notes = fill_gaps(f0_islands, island_notes)
+    f0_gaps, gap_notes = fill_gaps(f0_islands, island_notes)
+    level_db = frame_levels(y_harmonic, len(gap_notes))
+    f0_clean, notes, attack_filled = fill_attack_gaps(f0_gaps, gap_notes, level_db)
     return AnalysisResult(
         f0_clean, times, notes, tuning,
-        raw_f0=raw_f0, confidence=confidence, held_notes=held, swept_notes=swept,
+        raw_f0=raw_f0, confidence=confidence, attack_filled=attack_filled, level_db=level_db,
+        held_notes=held, swept_notes=swept,
         octave_shift=np.where((octave_notes >= 0) & (swept >= 0), octave_notes - swept, 0),
         removed=(octave_notes >= 0) & (island_notes < 0),
-        filled=(island_notes < 0) & (notes >= 0),
+        filled=(island_notes < 0) & (gap_notes >= 0),
         audio=y, tracked_audio=y_harmonic,
     )
 

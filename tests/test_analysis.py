@@ -291,3 +291,57 @@ def test_diagnostics_panel_renders(app):
     image = QImage(panel.size(), QImage.Format.Format_ARGB32)
     panel.render(image)
     assert "Result" in panel.explanation.text()
+
+
+# --- double stops, attacks, key detection -----------------------------------
+
+def overdriven(*voices, seconds=1.5, drive=6.0):
+    """Sum of harmonic tones (MIDI numbers) through overdrive, like an amped double stop."""
+    t = np.arange(int(SR * seconds)) / SR
+    x = sum(sum(a * np.sin(2 * np.pi * k * hz(m) * t) for k, a in enumerate([0.45, 1, 0.8, 0.55, 0.45], 1))
+            for m in voices)
+    x = np.tanh(drive * x / np.abs(x).max()) * np.exp(-t * 0.8)
+    return x.astype(np.float32)
+
+
+def test_attack_gap_goes_to_following_note():
+    notes = frames((69, 10), (-1, 8), (72, 20), (-1, 30), (74, 10))
+    f0 = np.where(notes >= 0, hz(np.maximum(notes, 0).astype(float)), 0.0)
+    level = np.zeros(len(notes))
+    level[48:58] = -40                      # the long gap is quiet partway through
+    _, filled_notes, filled = an.fill_attack_gaps(f0, notes, level)
+    assert set(filled_notes[10:18]) == {72} and filled[10:18].all()   # short loud gap -> next note
+    assert set(filled_notes[38:68]) == {-1}                            # long, partly quiet gap untouched
+
+
+def test_phantom_pitch_vs_real_low_note():
+    double_stop = overdriven(69, 64)        # A4 + E4: repeats at A2, which nobody plays
+    assert an.is_phantom_pitch(double_stop, SR, slice(20, 100), hz(45))
+    low_note = overdriven(57)               # a real A3
+    assert not an.is_phantom_pitch(low_note, SR, slice(20, 100), hz(57))
+
+
+def test_long_double_stop_reads_as_a_note_in_register():
+    y = np.concatenate([melody([72, 74, 72], note_seconds=0.5), overdriven(69, 64, seconds=1.6),
+                        melody([72, 74, 72], note_seconds=0.5)])
+    result = an.analyze_pitch(y, SR)
+    start = int(1.6 * SR / an.HOP_LENGTH)
+    middle = result.notes[start + 20:start + 120]
+    assert np.mean(np.isin(middle, [69, 64])) > 0.8   # not two octaves down at A2
+
+
+def test_key_uses_phrase_endings():
+    # A minor pentatonic phrases that each resolve on a long A
+    phrase = frames((72, 10), (74, 10), (76, 10), (79, 10), (76, 10), (69, 40), (-1, 30))
+    notes = np.concatenate([phrase] * 6)
+    assert an.detect_key(notes) == ("A", "Minor")
+    same_notes_resolving_to_c = np.concatenate([frames((69, 10), (74, 10), (76, 10), (79, 10), (76, 10),
+                                                       (72, 40), (-1, 30))] * 6)
+    assert an.detect_key(same_notes_resolving_to_c) == ("C", "Major")
+
+
+def test_close_alternatives_flag_ambiguity():
+    ambiguous = np.repeat([69, 72, 74, 76, 79], 20)        # pentatonic, no resolution
+    assert an.close_alternatives(ambiguous)
+    clear = np.concatenate([frames((69, 60), (72, 15), (76, 30), (-1, 30))] * 5)
+    assert an.detect_key(clear) == ("A", "Minor")

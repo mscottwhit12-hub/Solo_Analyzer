@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
 
 from analysis import (  # noqa: E402  (analysis sets up numba before librosa loads)
     DEFAULT_SCALE, MIN_PITCH_HZ, NOTE_NAMES, SAMPLE_RATE, SCALES,
-    AnalysisCancelled, analyze_pitch, cents_off, degree_breakdown, degree_of, detect_key,
+    AnalysisCancelled, analyze_pitch, cents_off, close_alternatives, degree_breakdown, degree_of, detect_key,
     display_range, extract_audio, get_intervals, load_cached, note_name, save_cached,
 )
 import recording
@@ -531,10 +531,12 @@ class GuitarTrackerApp(QMainWindow):
             self.diagnostics.ensure_ready()
 
         details = [f"Tuning: {result.tuning:+.0f}¢ from A440"]
-        key = detect_key(result.notes)
+        key = detect_key(result.notes, result.level_db)
         if key:
             root, mode = key
-            details.insert(0, f"Detected key: {root} {mode.lower()}")
+            alternatives = close_alternatives(result.notes, result.level_db)
+            also = f" (close: {', '.join(f'{r} {m.lower()}' for r, m in alternatives)})" if alternatives else ""
+            details.insert(0, f"Detected key: {root} {mode.lower()}{also}")
             if self.auto_key_input.isChecked():
                 for combo, value in ((self.root_input, root), (self.scale_input, mode)):
                     combo.blockSignals(True)

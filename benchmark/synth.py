@@ -32,26 +32,43 @@ class Truth:
     pitch: np.ndarray    # continuous intended pitch (midi, fractional) per render sample, nan = silent
     note: np.ndarray     # intended note (int midi) per render sample, -1 = silent
     stable: np.ndarray   # False during bend/slide transitions and attacks
+    double: np.ndarray   # True where a double stop is sounding (truth is its top note)
 
 
-def compose(seed, seconds):
-    """Random A minor solo as a list of events."""
+def compose(seed, seconds, tonic=69, degrees=A_MINOR, strong=PENTATONIC, triad=(0, 3, 7), bends=True):
+    """Random solo as a list of events, built from phrases like a real solo.
+
+    Notes come from `degrees` (semitones above `tonic`), favouring the `strong` ones. Each
+    phrase ends on a held tonic-chord tone (`triad`), the way solos resolve.
+    """
     rng = np.random.default_rng(seed)
-    pool = scale_notes(57, 86, A_MINOR)
-    weights = np.array([3.0 if (m - 69) % 12 in PENTATONIC else 1.0 for m in pool])
+    pool = [m for m in range(57, 87) if (m - tonic) % 12 in degrees]
+    weights = np.array([3.0 if (m - tonic) % 12 in strong else 1.0 for m in pool])
     weights *= np.exp(-((np.array(pool) - 72) / 9.0) ** 2)  # centred on the 5th-8th position
     weights /= weights.sum()
-    events, t, current = [], 0.3, 69
+    resolutions = [m for m in pool if (m - tonic) % 12 in triad]
+    res_weights = np.array([2.0 if (m - tonic) % 12 == 0 else 1.0 for m in resolutions])
+    events, t, current = [], 0.3, min(pool, key=lambda m: abs(m - 69))
+    phrase_left = rng.integers(4, 11)
     while t < seconds:
-        if rng.random() < 0.08:  # rest between phrases
-            t += rng.uniform(0.3, 0.9)
+        if phrase_left == 0:  # resolve on a held chord tone, then rest
+            near = [m for m in resolutions if abs(m - current) <= 7] or resolutions
+            w = np.array([res_weights[resolutions.index(m)] for m in near])
+            note = int(rng.choice(near, p=w / w.sum()))
+            dur = rng.uniform(0.5, 1.2)
+            events.append(dict(kind="picked", note=note, start=t, dur=dur, double_stop=False,
+                               vibrato=rng.uniform(25, 50), bend_time=0.2, release=False, slide_from=note))
+            current = note
+            t += dur + rng.uniform(0.3, 0.9)
+            phrase_left = rng.integers(4, 11)
             continue
+        phrase_left -= 1
         # mostly stepwise motion
         near = [m for m in pool if abs(m - current) <= 5] or pool
         w = np.array([weights[pool.index(m)] for m in near])
         note = int(rng.choice(near, p=w / w.sum()))
         r = rng.random()
-        if r < 0.18 and note in BENDS:
+        if r < 0.18 and bends and note in BENDS:
             kind, dur = "bend", rng.uniform(0.6, 1.4)
         elif r < 0.26:
             kind, dur = "slide", rng.uniform(0.25, 0.5)
@@ -67,6 +84,17 @@ def compose(seed, seconds):
         current = note
         t += dur
     return events
+
+
+def event_frames(events, seconds, hop_seconds):
+    """Per-frame intended note (-1 = silent) for a list of events, without rendering audio."""
+    notes = np.full(int(seconds / hop_seconds) + 1, -1, dtype=int)
+    for ev in events:
+        a, b = int(ev["start"] / hop_seconds), int((ev["start"] + ev["dur"]) / hop_seconds)
+        notes[a:b] = ev["note"]
+        if ev["kind"] == "bend":
+            notes[a + int(0.12 / hop_seconds):b] = BENDS[ev["note"]]
+    return notes
 
 
 def render(events, seconds, tuning_cents=-10.0, drive=6.0, reverb=0.25, noise_db=-42, seed=0):
@@ -146,7 +174,7 @@ def render(events, seconds, tuning_cents=-10.0, drive=6.0, reverb=0.25, noise_db
     x = x + reverb * np.convolve(x, ir)[:n]
     x = x / np.max(np.abs(x)) * 0.8
     x += 10 ** (noise_db / 20) * np.cumsum(rng.standard_normal(n)) / 300  # brownish room noise
-    return x, Truth(pitch, note, stable)
+    return x, Truth(pitch, note, stable, ~np.isnan(second))
 
 
 def backing(seconds, seed=0):

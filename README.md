@@ -68,17 +68,21 @@ The **Diagnostics** tab shows the audio the way the pitch tracker sees it, and w
    - **Vibrato** stays on its note. The note only changes once the pitch moves 0.7 semitones away.
    - **Bends and slides** count as the note they land on, so a D bent up to E never registers as D♯.
    - **Octave errors** get corrected. Distorted guitars and double stops can fool the tracker into reporting a note one or two octaves (or an octave and a fifth) too low. A passage that sits far outside the surrounding register is folded back. The spectrum decides which correction is right.
+   - **Double stops** (two strings at once) make the tracker report a phantom pitch two octaves below the top note. The app recognizes a phantom because there's no real energy at that pitch, so the passage gets corrected even when it's held a long time.
+   - **Note attacks:** right after a new note, the tracker needs about 0.1 s to commit (longer for a double stop). A short gap that stays loud is credited to the note that follows.
    - Blips shorter than 45 ms are dropped, and brief dropouts inside a held note are filled.
-6. The readout, the breakdown bar and key detection all use these notes, so they always agree. The key is estimated with Krumhansl–Kessler key profiles.
+6. The readout, the breakdown bar and key detection all use these notes, so they always agree.
+7. **Key detection** weighs how long each note is played against the Albrecht–Shanahan key profiles (measured on popular music), giving extra weight to notes that end a phrase, since solos tend to resolve on the tonic. Loudness tells a rest apart from a note's reverb tail. When another key fits almost as well (common with pentatonic playing), the app says so next to the detected key.
 
 The analysis works best on isolated or lightly backed guitar. With a full band, a loud bass can still be mistaken for the guitar while it rests.
 
 ## Accuracy benchmark
 
-`benchmark/` renders synthetic solos where the true note at every moment is known. They include bends, wide vibrato, slides, legato, double stops, a guitar tuned 10¢ flat, overdrive, room reverb, noise and AAC compression, with and without drums and bass. To score the current analysis:
+`benchmark/` renders synthetic solos where the true note at every moment is known. They include bends, wide vibrato, slides, legato, double stops, a guitar tuned 10¢ flat, overdrive, room reverb, noise and AAC compression, with and without drums and bass. The solos are built from phrases that resolve on chord tones.
 
 ```bash
-python benchmark/run.py
+python benchmark/run.py    # note accuracy, double stops, octave errors, breakdown bar, graph range
+python benchmark/keys.py   # key detection over 12 roots x 7 scale types (major, minor, pentatonics, blues, Dorian, Mixolydian)
 ```
 
 On 5 solos that weren't used to tune it, the note-tracking work changed results as follows:
@@ -89,6 +93,15 @@ On 5 solos that weren't used to tune it, the note-tracking work changed results 
 | "Out" share (ideal ≈ 0) | 3.9% | 1.9% |
 | Breakdown bar error | 7.7% | 4.6% |
 | Graph range beyond what's played | +2.0 octaves | +0.4 octaves |
+
+Then double stops and key detection, on held-out solos:
+
+| | Before | After |
+|---|---|---|
+| Notes identified correctly | 94.9% | 96.2% |
+| Double stops credited to the top note | 49.9% | 59.1% |
+| Played moments that get a note | 94.3% | 99.2% |
+| Keys detected correctly (252 solos, all keys and scale types) | 86.5% | 96.8% |
 
 ## Tests
 

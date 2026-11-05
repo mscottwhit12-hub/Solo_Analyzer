@@ -44,7 +44,7 @@ COLOR_NOTE = QColor(0, 255, 128)
 LEGEND = [
     ("Tracker pitch", COLOR_TRACKER), ("Final note", COLOR_NOTE), ("Octave fix", COLOR_OCTAVE),
     ("Bend/slide credited to target", COLOR_SWEEP), ("Held by hysteresis", COLOR_HOLD),
-    ("Blip removed", COLOR_REMOVED), ("Gap filled", COLOR_FILLED),
+    ("Blip removed", COLOR_REMOVED), ("Gap filled (dropout or note attack)", COLOR_FILLED),
 ]
 
 
@@ -179,6 +179,10 @@ def explain_frame(result, i, root, scale):
             steps.append("<b>Removed</b>: a blip shorter than 45 ms, too short to be a played note.")
         if result.filled is not None and result.filled[i]:
             steps.append(f"<b>Filled</b>: a brief dropout inside a held {note_label(result.notes[i])}.")
+        if result.attack_filled is not None and result.attack_filled[i]:
+            steps.append(f"<b>Attack</b>: the tracker hadn't locked on yet (it takes ~0.1 s after a new note, "
+                         f"longer for a double stop), but the guitar was clearly sounding, so this counts as "
+                         f"the note that follows, {note_label(result.notes[i])}.")
 
     final = int(result.notes[i])
     if final >= 0:
@@ -348,7 +352,8 @@ class SpectrogramWidget(QWidget):
                 (COLOR_SWEEP, (r.swept_notes[sl] != held) & (r.swept_notes[sl] >= 0)),
                 (COLOR_OCTAVE, r.octave_shift[sl] != 0),
                 (COLOR_REMOVED, r.removed[sl]),
-                (COLOR_FILLED, r.filled[sl]),
+                (COLOR_FILLED, r.filled[sl] | (r.attack_filled[sl] if r.attack_filled is not None
+                                               else np.zeros(f1 - f0, bool))),
             ]
             width = max(1.0, rect.width() / max(1, WINDOW_SECONDS * an.SAMPLE_RATE / an.HOP_LENGTH))
             p.setPen(Qt.PenStyle.NoPen)
