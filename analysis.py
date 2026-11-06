@@ -16,7 +16,7 @@ import imageio_ffmpeg
 import librosa
 import numpy as np
 from PyQt6.QtCore import QStandardPaths
-from scipy.signal import medfilt
+from scipy.signal import butter, medfilt, sosfiltfilt
 
 # --- Constants -------------------------------------------------------------
 
@@ -26,8 +26,16 @@ MIN_PITCH_HZ = 20.0      # anything at or below this is treated as "no pitch"
 PITCH_FLOOR = 'C2'       # pitch tracking range: below a drop-C low string...
 PITCH_CEILING = 'E6'     # ...up to the 24th fret of the high E string
 FRAME_LENGTH = 1024      # samples per pitch window (46 ms): short enough for fast runs
-USE_HPSS = True          # strip drums/percussive sound before tracking
-ANALYSIS_VERSION = 6     # bump whenever analysis output changes, to invalidate cached results
+USE_HPSS = False         # strip drums before tracking: off, it smears fast notes and drums didn't hurt tracking in tests
+HPSS_MARGIN = (1.0, 5.0)  # (harmonic, percussive) separation margins
+HPSS_KERNEL = 31          # median filter length in STFT frames (31 ~ 0.7 s)
+LOW_CUT_HZ = 150           # high-pass the tracking signal: stops a bass taking over; low guitar notes still track via harmonics
+# "Over a band" mode: ignore the whole bass range so a bass as loud as the lead can't win
+# (at equal level it does, even with LOW_CUT_HZ). Costs any lead notes below C4.
+BAND_MODE_FLOOR = 'C4'
+BAND_MODE_LOW_CUT_HZ = 250
+LOW_CUT_ORDER = 8
+ANALYSIS_VERSION = 8     # bump whenever analysis output changes, to invalidate cached results
 
 # Pitch is tracked in chunks so progress can be reported and analysis cancelled.
 # Each chunk gets extra context on both sides, which is discarded after tracking.
@@ -39,9 +47,10 @@ NOTE_HYSTERESIS = 0.7        # semitones the pitch must move before the note cha
 SWEEP_MIN_SEMITONES = 0.6    # a short run that travels at least this far...
 SWEEP_STRAIGHTNESS = 0.7     # ...mostly in one direction...
 SWEEP_MAX_SECONDS = 0.3      # ...within this time, still moving at its end, is a bend/slide
-STEADY_STEP_SEMITONES = 0.03 # frame-to-frame change below this is "holding"...
+STEADY_STEP_SEMITONES = 0.1  # frame-to-frame change below this is "holding"...
 STEADY_MIN_FRAMES = 3        # ...and a run that holds this long is a note, not a transition
 SETTLED_SEMITONES = 0.35     # a frame further than this from its note has left it
+GLIDE_MAX_STEP = 0.45        # bends move <= 0.4 semitones per frame; new notes jump ~1+
 
 # Clean-up (see fix_octave_errors, remove_islands, fill_gaps)
 OCTAVE_SUSPECT_SEMITONES = 10  # a passage this far from its neighbours may be an octave error...
@@ -54,11 +63,19 @@ OCTAVE_CONTEXT_SECONDS = 2.0   # the register is judged from this much playing e
 # frequency (sub-harmonics) or 2x, 3x (overtones)
 HARMONIC_SHIFTS = (12, 19, 24, 28, -12, -19)
 SALIENCE_FFT = 4096
+OCTAVE_EVIDENCE_RATIO = 1.0   # moved note's harmonics must beat the reported note's by this factor
 SALIENCE_HARMONICS = 5
 SALIENCE_DECAY = 0.8
 PHANTOM_MAX_RATIO = 0.25          # below -12 dB at its own pitch and octave, it isn't really sounding
                                   # (overdrive leaves difference tones there around -17 dB)
 MIN_NOTE_FRAMES = 4            # ~46 ms
+BLIP_KEEP_CONFIDENCE = 0.5     # ...unless the tracker is this sure...
+BLIP_KEEP_LEVEL_DB = -15.0     # ...and it's this loud (a real fast note)
+
+# Spectrum estimate where the tracker gives up (see estimate_unpitched_notes)
+ESTIMATE_MAX_SECONDS = 0.8     # loud no-pitch stretches up to this long...
+ESTIMATE_LEVEL_DB = -12.0      # ...at least this loud on average...
+DOUBLE_STOP_RIVAL_RATIO = 0.85 # ...a second note this strong (not an octave) means a double stop
 
 # Attack gaps (see fill_attack_gaps)
 ATTACK_GAP_MAX_SECONDS = 0.2   # a "no pitch" stretch this short...
@@ -216,7 +233,7 @@ def extract_audio(path):
             pass
 
 
-def track_pitch(y, sr, progress=None, cancelled=None):
+def track_pitch(y, sr, progress=None, cancelled=None, floor=None):
     """pYIN pitch tracking in chunks.
 
     Returns (f0 with nan where unvoiced, voiced flags, voicing probability).
@@ -236,7 +253,7 @@ def track_pitch(y, sr, progress=None, cancelled=None):
         last = min(n_frames, end + context)
         segment = y[first * HOP_LENGTH:min(len(y), last * HOP_LENGTH + HOP_LENGTH)]
         seg_f0, seg_voiced, seg_prob = librosa.pyin(
-            segment, fmin=librosa.note_to_hz(PITCH_FLOOR), fmax=librosa.note_to_hz(PITCH_CEILING),
+            segment, fmin=librosa.note_to_hz(floor or PITCH_FLOOR), fmax=librosa.note_to_hz(PITCH_CEILING),
             sr=sr, hop_length=HOP_LENGTH, frame_length=FRAME_LENGTH, fill_na=None,
         )
         keep = slice(start - first, end - first)
@@ -260,6 +277,8 @@ class AnalysisResult:
     confidence: np.ndarray = None    # tracker's probability that a pitch is present, 0-1
     attack_filled: np.ndarray = None # loud "no pitch" gap just before a note, given to that note
     level_db: np.ndarray = None      # loudness per frame, dB relative to the file's loud passages
+    estimated: np.ndarray = None     # tracker gave up but it was loud: note read off the spectrum
+    band_mode: bool = False          # analyzed with the bass range ignored
     held_notes: np.ndarray = None    # after rounding with hysteresis
     swept_notes: np.ndarray = None   # after crediting bends/slides to where they land
     octave_shift: np.ndarray = None  # semitones the octave fix moved each frame (0 = untouched)
@@ -270,7 +289,7 @@ class AnalysisResult:
     audio: np.ndarray = field(default=None, repr=False)
     tracked_audio: np.ndarray = field(default=None, repr=False)
 
-    DIAGNOSTIC_FIELDS = ("raw_f0", "confidence", "attack_filled", "level_db", "held_notes", "swept_notes",
+    DIAGNOSTIC_FIELDS = ("raw_f0", "confidence", "attack_filled", "estimated", "level_db", "held_notes", "swept_notes",
                          "octave_shift", "removed", "filled")
 
 
@@ -289,6 +308,42 @@ def frame_levels(y, n_frames):
     rms = np.pad(rms, (0, max(0, n_frames - len(rms))))[:n_frames]
     reference = np.percentile(rms, 95) if np.any(rms > 0) else 1.0
     return 20 * np.log10(rms / reference + 1e-9)
+
+
+def estimate_unpitched_notes(f0, notes, level_db, y, sr=SAMPLE_RATE, tuning=0.0):
+    """Read the note off the spectrum where the guitar is loud but the tracker gave up.
+
+    Two strings at once (a double stop) can leave the tracker with no pitch for the whole
+    note. For a loud stretch next to other notes, pick the candidate whose harmonics are
+    strongest, within an octave of the neighbouring notes. When two candidates are about
+    equally strong it's a double stop: take the higher one (the melody convention).
+    """
+    f0, notes = f0.copy(), notes.copy()
+    estimated = np.zeros(len(notes), dtype=bool)
+    max_len = int(ESTIMATE_MAX_SECONDS * SAMPLE_RATE / HOP_LENGTH)
+    near = int(OCTAVE_NEIGHBOUR_GAP * SAMPLE_RATE / HOP_LENGTH)
+    for s, e, note in runs(notes.copy()):
+        if note >= 0 or not MIN_NOTE_FRAMES <= e - s <= max_len:
+            continue
+        if np.mean(level_db[s:e]) < ESTIMATE_LEVEL_DB:
+            continue
+        around = np.concatenate((notes[max(0, s - near):s], notes[e:e + near]))
+        around = around[around >= 0]
+        if len(around) == 0:
+            continue  # not next to any playing: could be another instrument in a rest
+        centre = int(np.median(around))
+        candidates = list(range(max(36, centre - 12), min(88, centre + 12) + 1))
+        salience = {m: harmonic_salience(y, sr, slice(s, e), midi_to_hz(m + tuning / 100)) for m in candidates}
+        best = max(salience, key=salience.get)
+        if salience[best] <= 0:
+            continue
+        rivals = [m for m in candidates if salience[m] >= DOUBLE_STOP_RIVAL_RATIO * salience[best]
+                  and abs(m - best) >= 3 and abs(m - best) % 12]
+        pick = max([best] + rivals)
+        notes[s:e] = pick
+        f0[s:e] = midi_to_hz(pick + tuning / 100)
+        estimated[s:e] = True
+    return f0, notes, estimated
 
 
 def fill_attack_gaps(f0, notes, level_db):
@@ -380,7 +435,10 @@ def credit_sweeps(midi, notes):
         heading = np.sign(nxt - note)
         end_motion = midi[e - 1] - midi[max(s, e - 3)]
         held = longest_run(steps < STEADY_STEP_SEMITONES) >= STEADY_MIN_FRAMES
-        if (not held and abs(net) >= SWEEP_MIN_SEMITONES and abs(net) >= SWEEP_STRAIGHTNESS * steps.sum()
+        # A bend or slide glides (under ~0.4 semitones per frame); a new note in a fast run
+        # jumps a semitone or more at once, so a run with a jump is a played note, not a sweep.
+        gliding = steps.max() <= GLIDE_MAX_STEP
+        if (gliding and not held and abs(net) >= SWEEP_MIN_SEMITONES and abs(net) >= SWEEP_STRAIGHTNESS * steps.sum()
                 and np.sign(net) == heading and np.sign(end_motion) == heading):
             notes[s:e] = nxt  # the whole run is a transition
         elif heading:
@@ -452,11 +510,18 @@ def fix_octave_errors(f0, notes, y=None, sr=SAMPLE_RATE):
             fitting = [sh for sh in candidates if abs(note + sh - register) <= OCTAVE_FIT_SEMITONES]
             if not fitting:
                 continue
-            if y is not None and len(fitting) > 1:
+            if y is not None:
                 # The real note has energy at all its harmonics; a wrong guess misses some.
+                # Only move the passage if the spectrum backs the new note better than the
+                # one reported: another instrument can skew the register it's judged by.
                 base = np.median(f0[s:e])
-                shift = max(fitting, key=lambda sh: harmonic_salience(
-                    y, sr, slice(s, e), base * 2.0 ** (sh / 12)))
+                salience = {sh: harmonic_salience(y, sr, slice(s, e), base * 2.0 ** (sh / 12))
+                            for sh in [0] + fitting}
+                shift = max(fitting, key=salience.get)
+                # Only for single-octave moves: a double stop's phantom pitch (fixed by the
+                # larger shifts) looks well supported, since its harmonics include both notes.
+                if abs(shift) == 12 and salience[shift] <= salience[0] * OCTAVE_EVIDENCE_RATIO:
+                    continue
             else:
                 shift = min(fitting, key=lambda sh: abs(note + sh - register))
             notes[s:e] = note + shift
@@ -499,12 +564,21 @@ def disagrees_with_neighbours(notes, s, e, max_gap):
     return len(neighbours) == 2 and all(abs(notes[s] - n) >= OCTAVE_SUSPECT_SEMITONES for n in neighbours)
 
 
-def remove_islands(f0, notes):
-    """Drop pitched blips too short to be played notes (with nothing either side)."""
+def remove_islands(f0, notes, confidence=None, level_db=None):
+    """Drop pitched blips too short to be played notes (with nothing either side).
+
+    A very fast tapped or legato note can be this short too, so a blip is only dropped if
+    it's also unconvincing: low tracker confidence or quiet.
+    """
     f0, notes = f0.copy(), notes.copy()
     pitched = notes >= 0
     for s, e, on in runs(pitched):
-        if on and e - s < MIN_NOTE_FRAMES:
+        if not on or e - s >= MIN_NOTE_FRAMES:
+            continue
+        convincing = (confidence is not None and level_db is not None
+                      and np.mean(confidence[s:e]) >= BLIP_KEEP_CONFIDENCE
+                      and np.mean(level_db[s:e]) >= BLIP_KEEP_LEVEL_DB)
+        if not convincing:
             notes[s:e] = -1
             f0[s:e] = 0.0
     return f0, notes
@@ -532,25 +606,36 @@ def display_range(f0):
     return max(40.0, low * 0.9), max(high * 1.1, low * 2)
 
 
-def analyze_pitch(y, sr, progress=None, cancelled=None):
+def tracking_signal(y, sr=SAMPLE_RATE, band_mode=False):
+    """The audio as the pitch tracker hears it."""
+    if USE_HPSS:
+        # Harmonic/percussive separation to pull the guitar away from drums
+        y, _ = librosa.effects.hpss(y, margin=HPSS_MARGIN, kernel_size=HPSS_KERNEL)
+    low_cut = BAND_MODE_LOW_CUT_HZ if band_mode else LOW_CUT_HZ
+    if low_cut:
+        # Weaken anything below the lead guitar's range (bass, kick drum) so it can't win.
+        # Low guitar notes still track: the tracker finds them from their harmonics.
+        sos = butter(LOW_CUT_ORDER, low_cut, btype="highpass", fs=sr, output="sos")
+        y = sosfiltfilt(sos, y).astype(np.float32)
+    return y
+
+
+def analyze_pitch(y, sr, progress=None, cancelled=None, band_mode=False):
     """Pitch contour, per-frame notes and tuning for an audio signal.
 
     progress(fraction, message) is called as work completes; cancelled() is polled between chunks.
     """
     report = progress or (lambda fraction, message: None)
 
-    if USE_HPSS:
-        report(0.10, "Separating guitar from drums...")
-        # Aggressive harmonic/percussive separation to pull the guitar away from drums
-        y_harmonic, _ = librosa.effects.hpss(y, margin=(1.0, 5.0))
-    else:
-        y_harmonic = y
+    report(0.05, "Preparing audio...")
+    y_harmonic = tracking_signal(y, sr, band_mode)
     if cancelled and cancelled():
         raise AnalysisCancelled
 
     report(0.20, "Tracking pitch...")
     f0, voiced, confidence = track_pitch(
-        y_harmonic, sr, cancelled=cancelled, progress=lambda f: report(0.20 + 0.75 * f, "Tracking pitch..."))
+        y_harmonic, sr, cancelled=cancelled, progress=lambda f: report(0.20 + 0.75 * f, "Tracking pitch..."),
+        floor=BAND_MODE_FLOOR if band_mode else None)
 
     report(0.96, "Cleaning up...")
     f0[~voiced] = 0.0
@@ -563,44 +648,47 @@ def analyze_pitch(y, sr, progress=None, cancelled=None):
     held = hold_notes(midi, f0_smooth > MIN_PITCH_HZ)
     swept = credit_sweeps(midi, held)
     f0_octave, octave_notes = fix_octave_errors(f0_smooth, swept, y_harmonic, sr)
-    f0_islands, island_notes = remove_islands(f0_octave, octave_notes)
+    level_db = frame_levels(y_harmonic, len(octave_notes))
+    f0_islands, island_notes = remove_islands(f0_octave, octave_notes, confidence, level_db)
     f0_gaps, gap_notes = fill_gaps(f0_islands, island_notes)
-    level_db = frame_levels(y_harmonic, len(gap_notes))
+    filled = (island_notes < 0) & (gap_notes >= 0)
+    f0_gaps, gap_notes, estimated = estimate_unpitched_notes(f0_gaps, gap_notes, level_db, y_harmonic, sr, tuning)
     f0_clean, notes, attack_filled = fill_attack_gaps(f0_gaps, gap_notes, level_db)
     return AnalysisResult(
         f0_clean, times, notes, tuning,
-        raw_f0=raw_f0, confidence=confidence, attack_filled=attack_filled, level_db=level_db,
+        raw_f0=raw_f0, confidence=confidence, attack_filled=attack_filled, estimated=estimated, level_db=level_db,
         held_notes=held, swept_notes=swept,
         octave_shift=np.where((octave_notes >= 0) & (swept >= 0), octave_notes - swept, 0),
         removed=(octave_notes >= 0) & (island_notes < 0),
-        filled=(island_notes < 0) & (gap_notes >= 0),
-        audio=y, tracked_audio=y_harmonic,
+        filled=filled,
+        band_mode=band_mode, audio=y, tracked_audio=y_harmonic,
     )
 
 
 # --- Result cache ----------------------------------------------------------
 
-def cache_path(media_path):
+def cache_path(media_path, band_mode=False):
     """Where analysis results for this exact file (path, size, modified time) are stored."""
     stat = os.stat(media_path)
-    key = f"{ANALYSIS_VERSION}|{os.path.abspath(media_path)}|{stat.st_size}|{stat.st_mtime_ns}"
+    key = f"{ANALYSIS_VERSION}|{os.path.abspath(media_path)}|{stat.st_size}|{stat.st_mtime_ns}|band={band_mode}"
     folder = os.path.join(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.CacheLocation),
                           "analysis")
     return os.path.join(folder, hashlib.sha1(key.encode()).hexdigest() + ".npz")
 
 
-def load_cached(media_path):
+def load_cached(media_path, band_mode=False):
     try:
-        with np.load(cache_path(media_path)) as data:
+        with np.load(cache_path(media_path, band_mode)) as data:
             extras = {name: data[name] for name in AnalysisResult.DIAGNOSTIC_FIELDS if name in data}
-            return AnalysisResult(data["f0"], data["times"], data["notes"], float(data["tuning"]), **extras)
+            return AnalysisResult(data["f0"], data["times"], data["notes"], float(data["tuning"]),
+                                  band_mode=band_mode, **extras)
     except (OSError, KeyError, ValueError):
         return None
 
 
 def save_cached(media_path, result):
     try:
-        path = cache_path(media_path)
+        path = cache_path(media_path, result.band_mode)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         extras = {name: getattr(result, name) for name in AnalysisResult.DIAGNOSTIC_FIELDS
                   if getattr(result, name) is not None}

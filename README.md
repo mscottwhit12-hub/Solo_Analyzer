@@ -55,13 +55,17 @@ The **Diagnostics** tab shows the audio the way the pitch tracker sees it, and w
 - **Spectrogram:** frequency (with note labels) over 8 seconds around the playhead. It overlays the tracker's raw pitch (white dots) and the final notes (green). Below it, a lane marks every correction: octave fixes, bends/slides credited to their target note, notes held by hysteresis, removed blips and filled gaps. A second lane shows the tracker's confidence. Hover to read off a note and frequency, and click to jump there.
 - **Spectrum at the playhead:** the frequency content of that instant, with the chosen note's harmonics marked (1×, 2×, 3×…). If the tracker's raw pick differed, it's marked too.
 - **Step-by-step explanation** of the current moment, from what the tracker heard, through tuning, hysteresis, bend handling and octave fixes, to the final note and scale degree.
-- **Signal switch:** compare what the tracker analyzes (drums removed) with the original audio.
+- **Signal switch:** compare what the tracker analyzes (bass range cut) with the original audio.
+
+### Over a band
+
+Tick **Over a band** when the solo has a loud bass under it. The tracker then ignores everything below middle C (C4), so a bass as loud as the guitar can't be mistaken for the lead. Leave it off for solo guitar, or if the lead goes below middle C.
 
 ## How it works
 
 1. ffmpeg (bundled through `imageio-ffmpeg`) extracts mono audio at 22.05 kHz.
    Recordings capture audio through PortAudio (`sounddevice`) and webcam video through Qt, then ffmpeg combines them, correcting for the difference in start times.
-2. Harmonic/percussive separation removes most of the drums.
+2. Everything below 150 Hz is cut before tracking, so a bass guitar can't take over. Low guitar notes still track from their harmonics. (Drum removal was tried and dropped: it smeared fast notes, and drums didn't disturb tracking in tests.)
 3. librosa's pYIN tracks pitch between C2 and E6 (24th fret on the high E string), using 46 ms windows so fast runs stay sharp. It works in 10-second chunks so progress can be shown.
 4. **Tuning:** the app measures how far the guitar is from A440 and judges notes relative to that. The offset is shown next to the detected key.
 5. **Note tracking** turns the raw pitch into the notes being played:
@@ -70,7 +74,9 @@ The **Diagnostics** tab shows the audio the way the pitch tracker sees it, and w
    - **Octave errors** get corrected. Distorted guitars and double stops can fool the tracker into reporting a note one or two octaves (or an octave and a fifth) too low. A passage that sits far outside the surrounding register is folded back. The spectrum decides which correction is right.
    - **Double stops** (two strings at once) make the tracker report a phantom pitch two octaves below the top note. The app recognizes a phantom because there's no real energy at that pitch, so the passage gets corrected even when it's held a long time.
    - **Note attacks:** right after a new note, the tracker needs about 0.1 s to commit (longer for a double stop). A short gap that stays loud is credited to the note that follows.
-   - Blips shorter than 45 ms are dropped, and brief dropouts inside a held note are filled.
+   - **Fast runs** aren't mistaken for slides: a slide glides (under 0.4 semitones per step), while a new note jumps.
+   - Short blips are dropped only if they're also quiet or uncertain, so very fast tapped notes survive. Brief dropouts inside a held note are filled.
+   - **When the tracker gives up** but the guitar is loud (common on double stops), the note is read straight off the spectrum.
 6. The readout, the breakdown bar and key detection all use these notes, so they always agree.
 7. **Key detection** weighs how long each note is played against the Albrecht–Shanahan key profiles (measured on popular music), giving extra weight to notes that end a phrase, since solos tend to resolve on the tonic. Loudness tells a rest apart from a note's reverb tail. When another key fits almost as well (common with pentatonic playing), the app says so next to the detected key.
 
@@ -83,7 +89,25 @@ The analysis works best on isolated or lightly backed guitar. With a full band, 
 ```bash
 python benchmark/run.py    # note accuracy, double stops, octave errors, breakdown bar, graph range
 python benchmark/keys.py   # key detection over 12 roots x 7 scale types (major, minor, pentatonics, blues, Dorian, Mixolydian)
+python benchmark/realistic.py   # 5 messy "real-world" recordings, each with a clean control
 ```
+
+`realistic.py` renders five deliberately messy recordings with exact note truth, each also rendered clean as a control:
+
+1. Fast, high shred over a full band
+2. A live phone bootleg
+3. A practice room with the TV on
+4. A fuzz lead with a rhythm guitar playing in the same register
+5. Fast legato and tapping
+
+The lead guitar has realistic string behaviour, intonation drift, pick and fret noise, and an amp, speaker and room. The interference includes cymbals, bass, rhythm guitar, crowd noise, TV speech, mains hum, hiss and a phone mic. Results on new renders that weren't used for tuning:
+
+| Notes found | Before | After |
+|---|---|---|
+| All notes, clean / messy | 80.6% / 61.3% | 96.5% / 83.5% |
+| Fast (< 100 ms) and high (C6–E6), messy | 60.3% | 93.1% |
+| Tapped notes, messy | 45% | 90% |
+| Rhythm guitar in the same register, messy | 9% | 29% |
 
 On 5 solos that weren't used to tune it, the note-tracking work changed results as follows:
 

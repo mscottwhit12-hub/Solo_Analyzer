@@ -29,7 +29,7 @@ SPECTRUM_FFT = 4096
 WINDOW_SECONDS = 8.0          # spectrogram width; the playhead sits in the middle
 SPECTRUM_HARMONICS = 8
 
-SIGNAL_TRACKED = "What the tracker hears (drums removed)"
+SIGNAL_TRACKED = "What the tracker hears (bass range cut)"
 SIGNAL_ORIGINAL = "Original audio"
 
 # Decision-lane colours
@@ -44,7 +44,7 @@ COLOR_NOTE = QColor(0, 255, 128)
 LEGEND = [
     ("Tracker pitch", COLOR_TRACKER), ("Final note", COLOR_NOTE), ("Octave fix", COLOR_OCTAVE),
     ("Bend/slide credited to target", COLOR_SWEEP), ("Held by hysteresis", COLOR_HOLD),
-    ("Blip removed", COLOR_REMOVED), ("Gap filled (dropout or note attack)", COLOR_FILLED),
+    ("Blip removed", COLOR_REMOVED), ("Gap filled (dropout, attack, or read from spectrum)", COLOR_FILLED),
 ]
 
 
@@ -179,6 +179,11 @@ def explain_frame(result, i, root, scale):
             steps.append("<b>Removed</b>: a blip shorter than 45 ms, too short to be a played note.")
         if result.filled is not None and result.filled[i]:
             steps.append(f"<b>Filled</b>: a brief dropout inside a held {note_label(result.notes[i])}.")
+        if result.estimated is not None and result.estimated[i]:
+            steps.append(f"<b>Read from the spectrum</b>: the tracker gave up here (two strings at once often "
+                         f"do that) but the guitar was loud, so the note is the one whose harmonics are "
+                         f"strongest near the surrounding notes: {note_label(result.notes[i])}. If two notes "
+                         f"were equally strong (a double stop), the higher one counts.")
         if result.attack_filled is not None and result.attack_filled[i]:
             steps.append(f"<b>Attack</b>: the tracker hadn't locked on yet (it takes ~0.1 s after a new note, "
                          f"longer for a double stop), but the guitar was clearly sounding, so this counts as "
@@ -217,9 +222,8 @@ class DiagnosticsThread(QThread):
                 r.audio = an.extract_audio(self.media_path)
                 r.tracked_audio = None
             if r.tracked_audio is None:
-                self.progress.emit("Removing drums...")
-                r.tracked_audio = (librosa.effects.hpss(r.audio, margin=(1.0, 5.0))[0]
-                                   if an.USE_HPSS else r.audio)
+                self.progress.emit("Preparing audio...")
+                r.tracked_audio = an.tracking_signal(r.audio, band_mode=r.band_mode)
             self.progress.emit("Building spectrogram...")
             tracked = log_spectrogram(r.tracked_audio, cancelled=stop)
             original = tracked if r.tracked_audio is r.audio else log_spectrogram(r.audio, cancelled=stop)
@@ -352,8 +356,9 @@ class SpectrogramWidget(QWidget):
                 (COLOR_SWEEP, (r.swept_notes[sl] != held) & (r.swept_notes[sl] >= 0)),
                 (COLOR_OCTAVE, r.octave_shift[sl] != 0),
                 (COLOR_REMOVED, r.removed[sl]),
-                (COLOR_FILLED, r.filled[sl] | (r.attack_filled[sl] if r.attack_filled is not None
-                                               else np.zeros(f1 - f0, bool))),
+                (COLOR_FILLED, r.filled[sl]
+                 | (r.attack_filled[sl] if r.attack_filled is not None else np.zeros(f1 - f0, bool))
+                 | (r.estimated[sl] if r.estimated is not None else np.zeros(f1 - f0, bool))),
             ]
             width = max(1.0, rect.width() / max(1, WINDOW_SECONDS * an.SAMPLE_RATE / an.HOP_LENGTH))
             p.setPen(Qt.PenStyle.NoPen)
@@ -518,8 +523,8 @@ class DiagnosticsPanel(QWidget):
         controls.addWidget(QLabel("Signal:"))
         self.signal_input = QComboBox()
         self.signal_input.addItems([SIGNAL_TRACKED, SIGNAL_ORIGINAL])
-        self.signal_input.setToolTip("The pitch tracker analyzes the audio with drums removed; "
-                                     "switch to compare with the original.")
+        self.signal_input.setToolTip("The pitch tracker analyzes the audio with everything below the "
+                                     "lead guitar's range (bass, kick drum) cut; switch to compare with the original.")
         self.signal_input.currentTextChanged.connect(self._refresh)
         controls.addWidget(self.signal_input)
         self.tracker_input = QCheckBox("Tracker pitch")
@@ -570,7 +575,7 @@ class DiagnosticsPanel(QWidget):
         self.spectrogram.message = "Open this tab to prepare diagnostics"
         self.spectrum.clear()
         self.explanation.setText("")
-        self.signal_input.setEnabled(an.USE_HPSS)
+        self.signal_input.setEnabled(bool(an.USE_HPSS or an.LOW_CUT_HZ))
 
     def ensure_ready(self):
         """Start preparing spectrograms for the current result, if not already done."""

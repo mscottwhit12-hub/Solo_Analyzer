@@ -345,3 +345,89 @@ def test_close_alternatives_flag_ambiguity():
     assert an.close_alternatives(ambiguous)
     clear = np.concatenate([frames((69, 60), (72, 15), (76, 30), (-1, 30))] * 5)
     assert an.detect_key(clear) == ("A", "Minor")
+
+
+# --- fast notes, bass, octave guard (realistic-benchmark fixes) ----------------
+
+def test_fast_scale_run_is_not_mistaken_for_a_slide():
+    rng = np.random.default_rng(0)
+    run_notes = [76, 78, 79, 81, 83, 84, 86, 88]               # E5 up to E6, 16th notes at 150 bpm
+    pitch = np.repeat(run_notes, 8).astype(float) + rng.normal(0, 0.04, 64)  # tracker jitter
+    notes = an.quantize_notes(hz(pitch), 0.0)
+    for k, want in enumerate(run_notes):
+        assert np.mean(notes[k * 8 + 2:k * 8 + 7] == want) >= 0.8, (k, want)
+
+
+def test_confident_short_notes_survive_blip_removal():
+    notes = frames((-1, 10), (84, 3), (-1, 10), (60, 3), (-1, 10))
+    f0 = np.where(notes >= 0, hz(np.maximum(notes, 0).astype(float)), 0.0)
+    confidence = np.where(np.arange(len(notes)) < 15, 0.9, 0.1)   # the 84 is confident, the 60 isn't
+    level = np.zeros(len(notes))
+    _, kept = an.remove_islands(f0, notes, confidence, level)
+    assert 84 in kept and 60 not in kept
+
+
+def plucked_bass(length, level_rms):
+    """Bass guitar in eighth notes on A2/D2-ish roots, decaying each note."""
+    t = np.arange(length) / SR
+    eighth = 60 / 92 / 2
+    out = np.zeros(length)
+    for k in range(int(t[-1] / eighth) + 1):
+        a = int(k * eighth * SR)
+        m = min(length - a, int(eighth * SR))
+        tt = np.arange(m) / SR
+        f = hz([45, 50, 45, 52][(k // 8) % 4])
+        out[a:a + m] = (np.sin(2 * np.pi * f * tt) + 0.5 * np.sin(4 * np.pi * f * tt)
+                        + 0.25 * np.sin(6 * np.pi * f * tt)) * np.exp(-tt * 4)
+    return out / np.sqrt(np.mean(out ** 2)) * level_rms
+
+
+def lead_share(notes):
+    played = notes[notes >= 0]
+    return np.mean(played >= 64) if len(played) else 0.0
+
+
+def test_bass_below_the_lead_does_not_take_over():
+    lead = melody([69, 72, 74, 76, 79, 76, 74, 72], note_seconds=0.45)
+    mix = lead + plucked_bass(len(lead), np.sqrt(np.mean(lead ** 2)) * 10 ** (-6 / 20))  # bass 6 dB down
+    assert lead_share(an.analyze_pitch(mix.astype(np.float32), SR).notes) > 0.8
+
+
+def test_band_mode_survives_a_bass_as_loud_as_the_lead():
+    lead = melody([69, 72, 74, 76, 79, 76, 74, 72], note_seconds=0.45)
+    mix = (lead + plucked_bass(len(lead), np.sqrt(np.mean(lead ** 2)))).astype(np.float32)
+    assert lead_share(an.analyze_pitch(mix, SR).notes) < 0.2               # normal mode loses to it...
+    result = an.analyze_pitch(mix, SR, band_mode=True)
+    assert lead_share(result.notes) > 0.5 and result.band_mode              # ...band mode doesn't
+
+
+def test_single_octave_fix_needs_spectral_evidence():
+    # A real A4 whose surroundings (e.g. a rhythm guitar) sit an octave higher: keep A4
+    y = overdriven(69, seconds=1.0)
+    notes = frames((81, 60), (69, 40), (81, 60))
+    f0 = hz(notes.astype(float))
+    audio = np.concatenate([overdriven(81, seconds=0.7), y[:int(0.465 * SR)], overdriven(81, seconds=0.7)])
+    _, fixed = an.fix_octave_errors(f0, notes, audio, SR)
+    assert set(fixed[60:100]) == {69}
+
+
+def test_unpitched_double_stop_is_read_from_the_spectrum():
+    # A4 + E4 double stop the tracker can't pitch, between A minor notes
+    y = np.concatenate([melody([72, 74], note_seconds=0.4), overdriven(69, 64, seconds=0.5),
+                        melody([72, 69], note_seconds=0.4)]).astype(np.float32)
+    s, e = int(0.9 * SR / an.HOP_LENGTH), int(1.3 * SR / an.HOP_LENGTH)
+    notes = an.quantize_notes(an.midi_to_hz(np.full(len(y) // an.HOP_LENGTH + 1, 72.0)), 0.0)
+    notes[s:e] = -1                                   # tracker gave up on the double stop
+    f0 = np.where(notes >= 0, hz(72.0), 0.0)
+    level = np.zeros(len(notes))                      # loud throughout
+    _, filled, estimated = an.estimate_unpitched_notes(f0, notes, level, y, SR)
+    assert estimated[s:e].all()
+    assert np.bincount(filled[s:e]).argmax() == 69    # the top note, A4
+
+
+def test_quiet_gaps_are_not_filled_from_the_spectrum():
+    notes = frames((72, 30), (-1, 20), (72, 30))
+    f0 = np.where(notes >= 0, hz(72.0), 0.0)
+    level = np.full(len(notes), -40.0)                # a rest
+    _, filled, estimated = an.estimate_unpitched_notes(f0, notes, level, melody([72] * 3), SR)
+    assert not estimated.any() and set(filled[30:50]) == {-1}

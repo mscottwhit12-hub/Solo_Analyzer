@@ -37,9 +37,10 @@ class AudioAnalyzerThread(QThread):
     error = pyqtSignal(str)
     cancelled = pyqtSignal()
 
-    def __init__(self, media_path):
+    def __init__(self, media_path, band_mode=False):
         super().__init__()
         self.media_path = media_path
+        self.band_mode = band_mode
         self.cancel_requested = False
 
     def cancel(self):
@@ -51,7 +52,7 @@ class AudioAnalyzerThread(QThread):
                 self.error.emit("Selected file does not exist.")
                 return
 
-            cached = load_cached(self.media_path)
+            cached = load_cached(self.media_path, self.band_mode)
             if cached is not None:
                 self.analysis_done.emit(cached)
                 return
@@ -66,6 +67,7 @@ class AudioAnalyzerThread(QThread):
                 y, SAMPLE_RATE,
                 progress=lambda fraction, message: self.progress.emit(int(fraction * 100), message),
                 cancelled=lambda: self.cancel_requested,
+                band_mode=self.band_mode,
             )
             save_cached(self.media_path, result)
             self.analysis_done.emit(result)
@@ -335,6 +337,13 @@ class GuitarTrackerApp(QMainWindow):
         self.auto_key_input.setToolTip("Set the root and scale from the notes played when a file finishes analyzing")
         key_row.addWidget(self.auto_key_input)
 
+        self.band_mode_input = QCheckBox("Over a band")
+        self.band_mode_input.setToolTip(
+            "Ignore the bass range (below C4) so a loud bass guitar can't be mistaken for the lead.\n"
+            "Leave off for solo guitar, or if the lead plays notes below middle C.")
+        self.band_mode_input.toggled.connect(self.on_band_mode_changed)
+        key_row.addWidget(self.band_mode_input)
+
         self.detected_label = QLabel("")
         self.detected_label.setStyleSheet("color: #888;")
         key_row.addWidget(self.detected_label)
@@ -393,7 +402,7 @@ class GuitarTrackerApp(QMainWindow):
 
         # Keyboard shortcuts belong to the window, so keep controls from grabbing focus.
         for widget in (self.file_btn, self.record_btn, self.play_btn, self.cancel_btn, self.speed_input,
-                       self.root_input, self.scale_input, self.auto_key_input, self.scrubber):
+                       self.root_input, self.scale_input, self.auto_key_input, self.band_mode_input, self.scrubber):
             widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         self.media_player = QMediaPlayer()
@@ -435,6 +444,9 @@ class GuitarTrackerApp(QMainWindow):
             if value and combo.findText(value) >= 0:
                 combo.setCurrentText(value)
         self.auto_key_input.setChecked(self.settings.value("auto_key", True, type=bool))
+        self.band_mode_input.blockSignals(True)
+        self.band_mode_input.setChecked(self.settings.value("band_mode", False, type=bool))
+        self.band_mode_input.blockSignals(False)
         self.on_scale_changed()
 
     def save_settings(self):
@@ -443,6 +455,7 @@ class GuitarTrackerApp(QMainWindow):
         self.settings.setValue("scale", self.scale_input.currentText())
         self.settings.setValue("speed", self.speed_input.currentText())
         self.settings.setValue("auto_key", self.auto_key_input.isChecked())
+        self.settings.setValue("band_mode", self.band_mode_input.isChecked())
 
     # -- loading files --
 
@@ -500,7 +513,7 @@ class GuitarTrackerApp(QMainWindow):
 
         self.media_player.setSource(QUrl.fromLocalFile(path))
 
-        self.analyzer = AudioAnalyzerThread(path)
+        self.analyzer = AudioAnalyzerThread(path, self.band_mode_input.isChecked())
         self.analyzer.analysis_done.connect(self.on_analysis_finished)
         self.analyzer.progress.connect(self.on_analysis_progress)
         self.analyzer.error.connect(self.on_analysis_error)
@@ -570,6 +583,11 @@ class GuitarTrackerApp(QMainWindow):
         self.diagnostics.set_key(root, scale)
         self.breakdown_widget.update_breakdown(self.result.notes if self.result else None, root, scale)
         self.position_changed(self.media_player.position())
+
+    def on_band_mode_changed(self, _checked):
+        """Re-analyze the loaded file with the new tracking range (cached per setting)."""
+        if self.video_path and not self.is_busy():
+            self.load_file(self.video_path)
 
     def on_speed_changed(self, text):
         self.media_player.setPlaybackRate(int(text.rstrip("%")) / 100.0)

@@ -459,10 +459,20 @@ def profile_legato_tapping(rng):
 PROFILES = [profile_shred, profile_bootleg, profile_practice_room, profile_fuzz_bleed, profile_legato_tapping]
 
 
-def render_profile(make, seed, folder):
-    """Render a profile's noisy and clean versions to AAC files. Returns (info, truth per frame)."""
+CACHE = os.path.join(tempfile.gettempdir(), "solo_realistic_cases")
+
+
+def render_profile(make, seed, folder=None):
+    """Render a profile's noisy and clean versions to AAC files (cached). Returns (info, paths, truth, steady)."""
+    folder = folder or CACHE
+    os.makedirs(folder, exist_ok=True)
     rng = np.random.default_rng(seed)
     p = make(rng)
+    paths = {label: os.path.join(folder, f"{label}_{seed}.m4a") for label in ("noisy", "clean")}
+    truth_path = os.path.join(folder, f"truth_{seed}.npz")
+    if all(os.path.exists(x) for x in (*paths.values(), truth_path)):
+        t = np.load(truth_path)
+        return p, paths, t["truth"], t["steady"]
     seconds = p["seconds"]
     raw, truth, steady = lead_audio(p["notes"], seconds, rng, tuning_cents=p["lead"]["tuning"])
     guitar = amp_chain(raw, p["lead"]["drive"], rng, p["lead"]["sympathetic"])
@@ -489,6 +499,7 @@ def render_profile(make, seed, folder):
         subprocess.run([imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-i", wav, "-c:a", "aac", "-b:a", bitrate, paths[label]],
                        capture_output=True, check=True)
         os.remove(wav)
+    np.savez(truth_path, truth=truth, steady=steady)
     return p, paths, truth, steady
 
 
@@ -556,8 +567,7 @@ def main():
     import analysis as an
 
     keep = sys.argv[sys.argv.index("--write") + 1] if "--write" in sys.argv else None
-    folder = keep or tempfile.mkdtemp()
-    os.makedirs(folder, exist_ok=True)
+    folder = keep or CACHE
     everything = {"clean": [], "noisy": []}
     for seed, make in enumerate(PROFILES, start=1):
         p, paths, truth, steady = render_profile(make, seed, folder)
