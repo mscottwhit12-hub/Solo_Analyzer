@@ -57,6 +57,23 @@ The **Diagnostics** tab shows the audio the way the pitch tracker sees it, and w
 - **Step-by-step explanation** of the current moment, from what the tracker heard, through tuning, hysteresis, bend handling and octave fixes, to the final note and scale degree.
 - **Signal switch:** compare what the tracker analyzes (bass range cut) with the original audio.
 
+### Isolate guitar
+
+Tick **Isolate guitar** to separate the guitar from the drums, bass, keys and vocals with an AI model (Demucs) before the notes are tracked. The first time, the app offers to download the **guitar isolation pack**, about 250 MB, once. After that it works offline. Separation takes up to about the length of the song (measured at 0.5–2× real time on GitHub's Linux, Windows and Mac machines). The isolated audio is saved, so reopening the file or changing other settings doesn't separate it again.
+
+Measured on GitHub's machines with the real model:
+
+| Notes found | Without | Isolated |
+|---|---|---|
+| Messy realistic recordings (all five) | 83.6% | 94.2% |
+| Clean recordings (no band) | 96.5% | 96.4% |
+| Lead with a bass as loud as the guitar | 0% | 100% |
+| Lead with a rhythm guitar as loud, same register | 18.5% | 40.0% |
+
+It only partly separates two guitars from each other. Leave it off for solo guitar, where it adds time but no accuracy.
+
+The pack is built for Windows and macOS by `.github/workflows/separation.yml`, which also runs the real-model tests above and smoke-tests each built pack. Running from source, install `torch` and `demucs` instead, and isolation runs in-process.
+
 ### Over a band
 
 Tick **Over a band** when the solo has a loud bass under it. The tracker then ignores everything below middle C (C4), so a bass as loud as the guitar can't be mistaken for the lead. Leave it off for solo guitar, or if the lead goes below middle C.

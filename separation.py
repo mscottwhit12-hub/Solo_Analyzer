@@ -1,8 +1,8 @@
 """Isolate the guitar from a full mix before pitch tracking.
 
 Uses Demucs (htdemucs_6s), which splits music into vocals, drums, bass, piano, guitar and
-"other"; the analyzer then tracks the guitar stem only. Note that the guitar stem holds every
-guitar in the mix: it removes the band around a solo, not a second guitar.
+"other"; the analyzer tracks the guitar and "other" stems (see KEEP_STEMS). This removes the
+band around a solo; it only partly separates a second guitar.
 
 The model needs PyTorch, far too big to put in the app itself. So it runs either:
   - in-process, when torch and demucs are importable (running from source), or
@@ -27,7 +27,10 @@ import soundfile as sf
 
 MODEL = "htdemucs_6s"
 STEMS = ("drums", "bass", "other", "vocals", "guitar", "piano")
-KEEP_STEMS = ("guitar",)     # which stems the analysis listens to
+# Which stems the analysis listens to. Not "guitar" alone: the model files fast, high,
+# distorted leads under "other" as often as "guitar" (guitar alone lost 58% of notes on
+# fast high solos; guitar+other kept them and still removes drums, bass, keys and vocals).
+KEEP_STEMS = ("guitar", "other")
 MODEL_RATE = 44100
 OUTPUT_RATE = 22050          # what the analyzer works at
 CHUNK_SECONDS = 20.0         # separated in chunks so progress shows and cancel works
@@ -38,7 +41,7 @@ PACK_NAME = {"win32": "GuitarSeparator-windows.zip", "darwin": "GuitarSeparator-
     sys.platform, "GuitarSeparator-linux.zip")
 PACK_URL = os.environ.get("SOLO_ANALYZER_PACK_URL",
                           f"https://github.com/{REPO}/releases/latest/download/{PACK_NAME}")
-PACK_APPROX_MB = 300
+PACK_APPROX_MB = 250
 PACK_EXE = "GuitarSeparator.exe" if sys.platform == "win32" else "GuitarSeparator"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -281,7 +284,7 @@ def run_pack(stereo, progress=None, cancelled=None, exe=None):
 
 def _cache_file(media_path):
     stat = os.stat(media_path)
-    key = f"{MODEL}|{CHUNK_SECONDS}|{os.path.abspath(media_path)}|{stat.st_size}|{stat.st_mtime_ns}"
+    key = f"{MODEL}|{'+'.join(KEEP_STEMS)}|{CHUNK_SECONDS}|{os.path.abspath(media_path)}|{stat.st_size}|{stat.st_mtime_ns}"
     return os.path.join(data_dir(), "isolated", hashlib.sha1(key.encode()).hexdigest() + ".npy")
 
 

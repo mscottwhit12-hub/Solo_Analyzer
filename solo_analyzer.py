@@ -369,7 +369,7 @@ class GuitarTrackerApp(QMainWindow):
         self.isolate_input = QCheckBox("Isolate guitar")
         self.isolate_input.setToolTip(
             "Separate the guitar from drums, bass, keys and vocals with an AI model before tracking.\n"
-            "Slower, and a one-time download of about %d MB. It can't split two guitars apart."
+            "Slower, and a one-time download of about %d MB. It only partly separates a second guitar."
             % separation.PACK_APPROX_MB)
         self.isolate_input.toggled.connect(self.on_isolate_changed)
         key_row.addWidget(self.isolate_input)
@@ -641,7 +641,8 @@ class GuitarTrackerApp(QMainWindow):
             "Isolating the guitar uses an AI model (Demucs) that separates the guitar from drums, bass, "
             "keys and vocals before the notes are tracked.\n\n"
             f"It needs a one-time download of about {separation.PACK_APPROX_MB} MB, and analysis takes "
-            "noticeably longer. It can't separate two guitars from each other.\n\nDownload it now?",
+            "longer (up to about the length of the song). It only partly separates two "
+            "guitars from each other.\n\nDownload it now?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         return answer == QMessageBox.StandardButton.Yes
 
