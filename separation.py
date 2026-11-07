@@ -26,7 +26,8 @@ import numpy as np
 import soundfile as sf
 
 MODEL = "htdemucs_6s"
-STEM = "guitar"
+STEMS = ("drums", "bass", "other", "vocals", "guitar", "piano")
+KEEP_STEMS = ("guitar",)     # which stems the analysis listens to
 MODEL_RATE = 44100
 OUTPUT_RATE = 22050          # what the analyzer works at
 CHUNK_SECONDS = 20.0         # separated in chunks so progress shows and cancel works
@@ -166,7 +167,17 @@ def load_model(models_dir=None):
 
 
 def separate(stereo, model, progress=None, cancelled=None):
-    """Guitar stem (mono, OUTPUT_RATE) from stereo float32 audio (2, n) at MODEL_RATE."""
+    """The guitar track used for analysis (mono, OUTPUT_RATE) from stereo (2, n) at MODEL_RATE."""
+    return combine(separate_stems(stereo, model, progress, cancelled))
+
+
+def combine(stems):
+    """Mix the stems chosen by KEEP_STEMS."""
+    return sum(stems[name] for name in KEEP_STEMS).astype(np.float32)
+
+
+def separate_stems(stereo, model, progress=None, cancelled=None):
+    """{stem name: mono float32 at OUTPUT_RATE} from stereo float32 audio (2, n) at MODEL_RATE."""
     import torch
     from demucs.apply import apply_model
     from scipy.signal import resample_poly
@@ -176,11 +187,10 @@ def separate(stereo, model, progress=None, cancelled=None):
     ref = wav.mean(0)
     mean, std = ref.mean(), ref.std() + 1e-8
     wav = (wav - mean) / std
-    stem_index = model.sources.index(STEM)
 
     n = wav.shape[1]
     chunk, overlap = int(CHUNK_SECONDS * MODEL_RATE), int(OVERLAP_SECONDS * MODEL_RATE)
-    out = np.zeros(n, dtype=np.float32)
+    out = np.zeros((len(model.sources), n), dtype=np.float32)
     weight = np.zeros(n, dtype=np.float32)
     start = 0
     while start < n:
@@ -190,7 +200,7 @@ def separate(stereo, model, progress=None, cancelled=None):
         with torch.no_grad():
             sources = apply_model(model, wav[None, :, start:end], shifts=0, split=True,
                                   overlap=0.25, progress=False, device="cpu")
-        guitar = (sources[0, stem_index] * std + mean).mean(0).numpy()
+        stems = (sources[0] * std + mean / len(model.sources)).mean(1).numpy()  # (sources, samples)
         fade = np.ones(end - start, dtype=np.float32)
         if start > 0:
             ramp = min(overlap, end - start)
@@ -198,7 +208,7 @@ def separate(stereo, model, progress=None, cancelled=None):
         if end < n:
             ramp = min(overlap, end - start)
             fade[-ramp:] = np.minimum(fade[-ramp:], np.linspace(1, 0, ramp))
-        out[start:end] += guitar * fade
+        out[:, start:end] += stems * fade
         weight[start:end] += fade
         if progress:
             progress(end / n)
@@ -206,7 +216,8 @@ def separate(stereo, model, progress=None, cancelled=None):
             break
         start = end - overlap
     out /= np.maximum(weight, 1e-6)
-    return resample_poly(out, OUTPUT_RATE, MODEL_RATE).astype(np.float32)
+    return {name: resample_poly(out[i], OUTPUT_RATE, MODEL_RATE).astype(np.float32)
+            for i, name in enumerate(model.sources)}
 
 
 def stereo_from_file(path):
