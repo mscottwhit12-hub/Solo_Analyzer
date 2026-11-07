@@ -151,9 +151,18 @@ def download_pack(progress=None, cancelled=None, url=None):
 def load_model(models_dir=None):
     from demucs.pretrained import get_model
     from pathlib import Path
-    if models_dir:
+    if not models_dir:
+        return get_model(MODEL)  # downloads (or reuses) the official weights
+    # The bundled checkpoint stores model classes, which PyTorch 2.6+ refuses to unpickle by
+    # default. It's Meta's official file (its checksum is in the name and demucs verifies it),
+    # so allow it for this one load only.
+    import torch
+    original = torch.load
+    torch.load = lambda *args, **kwargs: original(*args, **{**kwargs, "weights_only": False})
+    try:
         return get_model(MODEL, repo=Path(models_dir))
-    return get_model(MODEL)
+    finally:
+        torch.load = original
 
 
 def separate(stereo, model, progress=None, cancelled=None):
