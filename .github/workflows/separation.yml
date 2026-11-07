@@ -1,0 +1,112 @@
+name: Guitar isolation
+
+# Real-model tests for "Isolate guitar" (the model can't be downloaded in the dev sandbox),
+# and the downloadable guitar isolation pack. Packs are attached to releases on v* tags.
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+    paths: ["separation.py", "analysis.py", "GuitarSeparator.spec", "benchmark/**", ".github/workflows/separation.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  DEMUCS_DEPS: "dora-search einops julius openunmix pyyaml tqdm omegaconf"
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+          pip install torch torchaudio --index-url https://download.pytorch.org/whl/cpu
+          pip install --no-deps demucs==4.0.1
+          pip install $DEMUCS_DEPS
+      - name: Separator program end to end
+        run: |
+          python -c "import numpy as np, soundfile as sf; t=np.arange(44100*6)/44100; x=np.sin(2*np.pi*440*t)*0.3; sf.write('in.wav', np.stack([x,x],1), 44100)"
+          python separation.py in.wav out.wav
+          python -c "import soundfile as sf; y, r = sf.read('out.wav'); assert r == 22050 and abs(len(y) - 6*22050) < 50, (r, len(y)); print('separator CLI OK', r, len(y))"
+      - name: Does isolation help? (real model)
+        run: python benchmark/separation_eval.py --stems stems
+      - uses: actions/upload-artifact@v5
+        with:
+          name: isolated-guitar-stems
+          path: stems
+
+  pack:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            asset: GuitarSeparator-windows.zip
+          - os: macos-latest
+            asset: GuitarSeparator-macos.zip
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+          pip install torch torchaudio
+          pip install --no-deps demucs==4.0.1
+          pip install $DEMUCS_DEPS
+      - name: Fetch model weights
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, shutil, torch, demucs
+          from demucs.pretrained import get_model
+          get_model("htdemucs_6s")
+          os.makedirs("build/models", exist_ok=True)
+          shutil.copy(os.path.join(os.path.dirname(demucs.__file__), "remote", "htdemucs_6s.yaml"), "build/models")
+          ckpt = os.path.join(torch.hub.get_dir(), "checkpoints")
+          for f in os.listdir(ckpt):
+              if f.startswith("5c90dfd2"):
+                  shutil.copy(os.path.join(ckpt, f), "build/models")
+          print(os.listdir("build/models"))
+          PY
+      - name: Build pack
+        run: pyinstaller GuitarSeparator.spec --noconfirm
+      - name: Smoke-test the built pack
+        shell: bash
+        run: |
+          exe=dist/GuitarSeparator/GuitarSeparator; [ -f "$exe.exe" ] && exe="$exe.exe"
+          du -sh dist/GuitarSeparator
+          python benchmark/pack_smoke_test.py "$exe"
+      - name: Zip (Windows)
+        if: runner.os == 'Windows'
+        run: Compress-Archive -Path dist/GuitarSeparator -DestinationPath ${{ matrix.asset }}
+      - name: Zip (macOS)
+        if: runner.os == 'macOS'
+        run: ditto -c -k --keepParent dist/GuitarSeparator ${{ matrix.asset }}
+      - name: Pack size
+        shell: bash
+        run: ls -la ${{ matrix.asset }}
+      - uses: actions/upload-artifact@v5
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.asset }}

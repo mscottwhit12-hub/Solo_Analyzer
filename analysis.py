@@ -279,6 +279,7 @@ class AnalysisResult:
     level_db: np.ndarray = None      # loudness per frame, dB relative to the file's loud passages
     estimated: np.ndarray = None     # tracker gave up but it was loud: note read off the spectrum
     band_mode: bool = False          # analyzed with the bass range ignored
+    isolated: bool = False           # tracked on the guitar stem separated from the mix
     held_notes: np.ndarray = None    # after rounding with hysteresis
     swept_notes: np.ndarray = None   # after crediting bends/slides to where they land
     octave_shift: np.ndarray = None  # semitones the octave fix moved each frame (0 = untouched)
@@ -620,15 +621,21 @@ def tracking_signal(y, sr=SAMPLE_RATE, band_mode=False):
     return y
 
 
-def analyze_pitch(y, sr, progress=None, cancelled=None, band_mode=False):
+def analyze_pitch(y, sr, progress=None, cancelled=None, band_mode=False, isolated=None):
     """Pitch contour, per-frame notes and tuning for an audio signal.
 
     progress(fraction, message) is called as work completes; cancelled() is polled between chunks.
+    `isolated`, if given, is the guitar separated from the mix (same rate): pitch is tracked on
+    it, while `y` stays the original audio (shown in the Diagnostics tab).
     """
     report = progress or (lambda fraction, message: None)
 
     report(0.05, "Preparing audio...")
-    y_harmonic = tracking_signal(y, sr, band_mode)
+    source = y
+    if isolated is not None:
+        source = np.zeros(len(y), dtype=np.float32)  # decoders can differ by a few samples
+        source[:min(len(y), len(isolated))] = isolated[:len(y)]
+    y_harmonic = tracking_signal(source, sr, band_mode)
     if cancelled and cancelled():
         raise AnalysisCancelled
 
@@ -661,34 +668,34 @@ def analyze_pitch(y, sr, progress=None, cancelled=None, band_mode=False):
         octave_shift=np.where((octave_notes >= 0) & (swept >= 0), octave_notes - swept, 0),
         removed=(octave_notes >= 0) & (island_notes < 0),
         filled=filled,
-        band_mode=band_mode, audio=y, tracked_audio=y_harmonic,
+        band_mode=band_mode, isolated=isolated is not None, audio=y, tracked_audio=y_harmonic,
     )
 
 
 # --- Result cache ----------------------------------------------------------
 
-def cache_path(media_path, band_mode=False):
+def cache_path(media_path, band_mode=False, isolated=False):
     """Where analysis results for this exact file (path, size, modified time) are stored."""
     stat = os.stat(media_path)
-    key = f"{ANALYSIS_VERSION}|{os.path.abspath(media_path)}|{stat.st_size}|{stat.st_mtime_ns}|band={band_mode}"
+    key = f"{ANALYSIS_VERSION}|{os.path.abspath(media_path)}|{stat.st_size}|{stat.st_mtime_ns}|band={band_mode}|iso={isolated}"
     folder = os.path.join(QStandardPaths.writableLocation(QStandardPaths.StandardLocation.CacheLocation),
                           "analysis")
     return os.path.join(folder, hashlib.sha1(key.encode()).hexdigest() + ".npz")
 
 
-def load_cached(media_path, band_mode=False):
+def load_cached(media_path, band_mode=False, isolated=False):
     try:
-        with np.load(cache_path(media_path, band_mode)) as data:
+        with np.load(cache_path(media_path, band_mode, isolated)) as data:
             extras = {name: data[name] for name in AnalysisResult.DIAGNOSTIC_FIELDS if name in data}
             return AnalysisResult(data["f0"], data["times"], data["notes"], float(data["tuning"]),
-                                  band_mode=band_mode, **extras)
+                                  band_mode=band_mode, isolated=isolated, **extras)
     except (OSError, KeyError, ValueError):
         return None
 
 
 def save_cached(media_path, result):
     try:
-        path = cache_path(media_path, result.band_mode)
+        path = cache_path(media_path, result.band_mode, result.isolated)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         extras = {name: getattr(result, name) for name in AnalysisResult.DIAGNOSTIC_FIELDS
                   if getattr(result, name) is not None}
