@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
 )
 
 import analysis as an
+import separation
 from ui_common import BACKGROUND, BORDER, PLACEHOLDER_TEXT, UI_FONT, paint_background
 
 # Spectrogram geometry: rows are log-spaced, ROWS_PER_SEMITONE per semitone from C2 to C8
@@ -30,6 +31,7 @@ WINDOW_SECONDS = 8.0          # spectrogram width; the playhead sits in the midd
 SPECTRUM_HARMONICS = 8
 
 SIGNAL_TRACKED = "What the tracker hears (bass range cut)"
+SIGNAL_TRACKED_ISOLATED = "What the tracker hears (isolated guitar)"
 SIGNAL_ORIGINAL = "Original audio"
 
 # Decision-lane colours
@@ -223,12 +225,17 @@ class DiagnosticsThread(QThread):
                 r.tracked_audio = None
             if r.tracked_audio is None:
                 self.progress.emit("Preparing audio...")
-                r.tracked_audio = an.tracking_signal(r.audio, band_mode=r.band_mode)
+                source = r.audio
+                if r.isolated:  # the separated guitar is cached; re-separate only if it was cleared
+                    guitar = separation.isolate_file(self.media_path, cancelled=stop)
+                    source = np.zeros(len(r.audio), dtype=np.float32)
+                    source[:min(len(r.audio), len(guitar))] = guitar[:len(r.audio)]
+                r.tracked_audio = an.tracking_signal(source, band_mode=r.band_mode)
             self.progress.emit("Building spectrogram...")
             tracked = log_spectrogram(r.tracked_audio, cancelled=stop)
             original = tracked if r.tracked_audio is r.audio else log_spectrogram(r.audio, cancelled=stop)
             self.ready.emit({"tracked": tracked, "original": original})
-        except an.AnalysisCancelled:
+        except (an.AnalysisCancelled, separation.SeparationCancelled):
             pass
         except Exception as e:
             self.failed.emit(str(e))
@@ -575,7 +582,9 @@ class DiagnosticsPanel(QWidget):
         self.spectrogram.message = "Open this tab to prepare diagnostics"
         self.spectrum.clear()
         self.explanation.setText("")
-        self.signal_input.setEnabled(bool(an.USE_HPSS or an.LOW_CUT_HZ))
+        self.signal_input.setEnabled(bool(an.USE_HPSS or an.LOW_CUT_HZ or (result and result.isolated)))
+        self.signal_input.setItemText(0, SIGNAL_TRACKED_ISOLATED if result is not None and result.isolated
+                                      else SIGNAL_TRACKED)
 
     def ensure_ready(self):
         """Start preparing spectrograms for the current result, if not already done."""
@@ -615,7 +624,7 @@ class DiagnosticsPanel(QWidget):
         self._refresh()
 
     def _signal(self):
-        tracked = self.signal_input.currentText() == SIGNAL_TRACKED
+        tracked = self.signal_input.currentIndex() == 0
         return ("tracked" if tracked else "original",
                 self.result.tracked_audio if tracked else self.result.audio)
 

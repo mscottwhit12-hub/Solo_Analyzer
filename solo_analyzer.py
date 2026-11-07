@@ -19,6 +19,7 @@ from analysis import (  # noqa: E402  (analysis sets up numba before librosa loa
     display_range, extract_audio, get_intervals, load_cached, note_name, save_cached,
 )
 import recording
+import separation
 from diagnostics import DiagnosticsPanel
 from ui_common import PLACEHOLDER_TEXT, UI_FONT, degree_color, paint_background
 
@@ -30,6 +31,8 @@ FINE_SEEK_STEP_MS = 1000
 
 # --- Analysis thread -------------------------------------------------------
 
+ISOLATION_SHARE = 0.7  # share of the progress bar for guitar isolation (it's the slow part)
+
 class AudioAnalyzerThread(QThread):
     """Extracts the audio track and runs pitch detection off the GUI thread."""
     analysis_done = pyqtSignal(object)  # AnalysisResult
@@ -37,10 +40,11 @@ class AudioAnalyzerThread(QThread):
     error = pyqtSignal(str)
     cancelled = pyqtSignal()
 
-    def __init__(self, media_path, band_mode=False):
+    def __init__(self, media_path, band_mode=False, isolate=False):
         super().__init__()
         self.media_path = media_path
         self.band_mode = band_mode
+        self.isolate = isolate
         self.cancel_requested = False
 
     def cancel(self):
@@ -52,7 +56,7 @@ class AudioAnalyzerThread(QThread):
                 self.error.emit("Selected file does not exist.")
                 return
 
-            cached = load_cached(self.media_path, self.band_mode)
+            cached = load_cached(self.media_path, self.band_mode, self.isolate)
             if cached is not None:
                 self.analysis_done.emit(cached)
                 return
@@ -63,16 +67,34 @@ class AudioAnalyzerThread(QThread):
                 self.error.emit("The file contains no audio track to analyze.")
                 return
 
+            stop = lambda: self.cancel_requested  # noqa: E731
+            guitar, start = None, 0.0
+            if self.isolate:
+                if separation.available() is None:
+                    separation.download_pack(
+                        progress=lambda done, total: self.progress.emit(
+                            int(done / total * 100) if total else 0,
+                            f"Downloading guitar isolation pack ({done:.0f} of {total:.0f} MB)..."),
+                        cancelled=stop)
+                guitar = separation.isolate_file(
+                    self.media_path, cancelled=stop,
+                    progress=lambda f: self.progress.emit(int(f * ISOLATION_SHARE * 100), "Isolating the guitar..."))
+                start = ISOLATION_SHARE
+
             result = analyze_pitch(
                 y, SAMPLE_RATE,
-                progress=lambda fraction, message: self.progress.emit(int(fraction * 100), message),
-                cancelled=lambda: self.cancel_requested,
+                progress=lambda fraction, message: self.progress.emit(
+                    int((start + (1 - start) * fraction) * 100), message),
+                cancelled=stop,
                 band_mode=self.band_mode,
+                isolated=guitar,
             )
             save_cached(self.media_path, result)
             self.analysis_done.emit(result)
-        except AnalysisCancelled:
+        except (AnalysisCancelled, separation.SeparationCancelled):
             self.cancelled.emit()
+        except separation.SeparationUnavailable as e:
+            self.error.emit(str(e))
         except Exception as e:
             self.error.emit(f"An unexpected error occurred:\n{e}")
 
@@ -344,6 +366,14 @@ class GuitarTrackerApp(QMainWindow):
         self.band_mode_input.toggled.connect(self.on_band_mode_changed)
         key_row.addWidget(self.band_mode_input)
 
+        self.isolate_input = QCheckBox("Isolate guitar")
+        self.isolate_input.setToolTip(
+            "Separate the guitar from drums, bass, keys and vocals with an AI model before tracking.\n"
+            "Slower, and a one-time download of about %d MB. It can't split two guitars apart."
+            % separation.PACK_APPROX_MB)
+        self.isolate_input.toggled.connect(self.on_isolate_changed)
+        key_row.addWidget(self.isolate_input)
+
         self.detected_label = QLabel("")
         self.detected_label.setStyleSheet("color: #888;")
         key_row.addWidget(self.detected_label)
@@ -402,7 +432,8 @@ class GuitarTrackerApp(QMainWindow):
 
         # Keyboard shortcuts belong to the window, so keep controls from grabbing focus.
         for widget in (self.file_btn, self.record_btn, self.play_btn, self.cancel_btn, self.speed_input,
-                       self.root_input, self.scale_input, self.auto_key_input, self.band_mode_input, self.scrubber):
+                       self.root_input, self.scale_input, self.auto_key_input, self.band_mode_input,
+                       self.isolate_input, self.scrubber):
             widget.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         self.media_player = QMediaPlayer()
@@ -446,6 +477,10 @@ class GuitarTrackerApp(QMainWindow):
         self.auto_key_input.setChecked(self.settings.value("auto_key", True, type=bool))
         self.band_mode_input.blockSignals(True)
         self.band_mode_input.setChecked(self.settings.value("band_mode", False, type=bool))
+        self.isolate_input.blockSignals(True)
+        self.isolate_input.setChecked(self.settings.value("isolate", False, type=bool)
+                                      and separation.available() is not None)
+        self.isolate_input.blockSignals(False)
         self.band_mode_input.blockSignals(False)
         self.on_scale_changed()
 
@@ -456,6 +491,7 @@ class GuitarTrackerApp(QMainWindow):
         self.settings.setValue("speed", self.speed_input.currentText())
         self.settings.setValue("auto_key", self.auto_key_input.isChecked())
         self.settings.setValue("band_mode", self.band_mode_input.isChecked())
+        self.settings.setValue("isolate", self.isolate_input.isChecked())
 
     # -- loading files --
 
@@ -513,7 +549,7 @@ class GuitarTrackerApp(QMainWindow):
 
         self.media_player.setSource(QUrl.fromLocalFile(path))
 
-        self.analyzer = AudioAnalyzerThread(path, self.band_mode_input.isChecked())
+        self.analyzer = AudioAnalyzerThread(path, self.band_mode_input.isChecked(), self.isolate_input.isChecked())
         self.analyzer.analysis_done.connect(self.on_analysis_finished)
         self.analyzer.progress.connect(self.on_analysis_progress)
         self.analyzer.error.connect(self.on_analysis_error)
@@ -543,7 +579,7 @@ class GuitarTrackerApp(QMainWindow):
         if self.tabs.currentWidget() is self.diagnostics:
             self.diagnostics.ensure_ready()
 
-        details = [f"Tuning: {result.tuning:+.0f}¢ from A440"]
+        details = [f"Tuning: {result.tuning:+.0f}¢ from A440"] + (["guitar isolated"] if result.isolated else [])
         key = detect_key(result.notes, result.level_db)
         if key:
             root, mode = key
@@ -588,6 +624,26 @@ class GuitarTrackerApp(QMainWindow):
         """Re-analyze the loaded file with the new tracking range (cached per setting)."""
         if self.video_path and not self.is_busy():
             self.load_file(self.video_path)
+
+    def on_isolate_changed(self, checked):
+        """Turning isolation on the first time needs the pack: ask before downloading it."""
+        if checked and separation.available() is None and not self.confirm_pack_download():
+            self.isolate_input.blockSignals(True)
+            self.isolate_input.setChecked(False)
+            self.isolate_input.blockSignals(False)
+            return
+        if self.video_path and not self.is_busy():
+            self.load_file(self.video_path)
+
+    def confirm_pack_download(self):
+        answer = QMessageBox.question(
+            self, "Isolate guitar",
+            "Isolating the guitar uses an AI model (Demucs) that separates the guitar from drums, bass, "
+            "keys and vocals before the notes are tracked.\n\n"
+            f"It needs a one-time download of about {separation.PACK_APPROX_MB} MB, and analysis takes "
+            "noticeably longer. It can't separate two guitars from each other.\n\nDownload it now?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        return answer == QMessageBox.StandardButton.Yes
 
     def on_speed_changed(self, text):
         self.media_player.setPlaybackRate(int(text.rstrip("%")) / 100.0)
